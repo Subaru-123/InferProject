@@ -311,6 +311,17 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
   // 全量同步 block_table 到 GPU（prefill 结束后的最终状态）
   sync_block_table_to_gpu(model);
 
+  // DEBUG: 打印每个请求的 block_table 状态
+  for (int32_t r = 0; r < (int32_t)sentences.size(); ++r) {
+    printf("[BLK] req %d blocks: ", r);
+    for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
+      int32_t blk = model.single_req_block_table_host_[r * model.max_blocks_per_req_ + k];
+      if (blk >= 0) printf("%d ", blk);
+    }
+    printf("\n");
+  }
+  fflush(stdout);
+
   has_pending = (scheduler.active_count() > 0);
 
   while (has_pending && total_steps < max_gen_steps * 2) {
