@@ -235,6 +235,9 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
         }
       }
 
+      // 同步 host → GPU（确保 MHA kernel 读到正确的 block ID）
+      sync_block_table_to_gpu(model);
+
       // 步骤 2: forward 本块的 token
       std::vector<int32_t> chunk_tokens(tokens.begin() + start, tokens.begin() + end);
       auto emb = model.embedding(chunk_tokens);
