@@ -166,6 +166,7 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
 
   // ── 提交所有请求到调度器 ──
   std::unordered_map<int32_t, int32_t> req_id_to_prompt_idx;
+  std::vector<std::vector<int32_t>> generated_outputs(sentences.size());
   for (int32_t i = 0; i < (int32_t)sentences.size(); ++i) {
     auto tokens = model.encode(sentences[i]);
     int32_t rid = scheduler.submit(tokens, max_gen_steps);
@@ -269,9 +270,11 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
         req.status = ReqStatus::kDecoding;
       }
 
-      // 终止或达上限
+      // 终止或达上限 → 保存结果再释放
       if (model.is_sentence_ending(next)
           || static_cast<int32_t>(req.generated_ids.size()) >= max_gen_steps) {
+        int32_t pidx = req_id_to_prompt_idx[rid];
+        generated_outputs[pidx] = std::move(req.generated_ids);
         scheduler.finish_request(rid, model.block_manager_);
       }
     }
@@ -279,11 +282,13 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
     total_steps++;
   }
 
-  // ── 输出（按 prompt 索引查找结果） ──
+  // ── 输出 ──
   if (need_output) {
     for (int32_t i = 0; i < (int32_t)sentences.size(); ++i) {
       printf("\n==================================\n");
       printf("Prompt %d: %s\n", i, sentences[i].c_str());
+      printf("Output %d: %s%s\n", i, sentences[i].c_str(),
+             model.decode(generated_outputs[i]).data());
       printf("==================================\n");
     }
     fflush(stdout);
