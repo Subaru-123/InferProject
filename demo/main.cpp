@@ -198,64 +198,68 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
   }
 
   // ════════════════════════════════════════════════════════════
-  // [Prefill优化] Phase B: 批量 Prefill
-  //   每个请求的 N 个 prompt token 打包为一次 forward → 1 step 完成 prefill
-  //   block_table: N 个 batch 位置共享同一行（同一请求写入同一组物理块）
+  // [Prefill优化] Phase B: Chunked Prefill
+  //   prompt 按 max_batch_size_ 切块，块内共享 block_table 行
+  //   例如 prompt_len=18, batch=8 → 3 chunks (8+8+2), 3次 forward
+  //   对比旧版逐 token: 18 次 forward (每 token 一次)
   // ════════════════════════════════════════════════════════════
   int32_t vocab_size = std::abs(model.config_->vocab_size_);
-  // 为每个请求分配专用 block_table 行（行号 = req index）
-  std::vector<int32_t> req_row(sentences.size(), -1);
+  int32_t chunk_limit = model.max_batch_size_;  // 每块最多 token 数
 
   for (int32_t r = 0; r < (int32_t)sentences.size(); ++r) {
     auto tokens = model.encode(sentences[r]);
     int32_t N = static_cast<int32_t>(tokens.size());
-    req_row[r] = r;  // 每个请求独占一行
-
-    // 保存除 prefill batch 之外的其他行
+    int32_t saved_row = r;
     auto saved_block_table = model.single_req_block_table_host_;
 
-    // 步骤 1: 初始化该请求的 block_table 行（全 -1）
+    // 重置该请求的 block_table 行
     for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
-      model.single_req_block_table_host_[req_row[r] * model.max_blocks_per_req_ + k] = -1;
+      model.single_req_block_table_host_[saved_row * model.max_blocks_per_req_ + k] = -1;
     }
 
-    // 步骤 2: 将 request 行复制到 N 个 prefill batch 行
-    //   batch 行 [0..N-1] 全部指向和 request 行相同的物理块
-    for (int32_t p = 0; p < N; ++p) {
-      for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
-        model.single_req_block_table_host_[p * model.max_blocks_per_req_ + k] =
-            model.single_req_block_table_host_[req_row[r] * model.max_blocks_per_req_ + k];
+    int32_t num_chunks = (N + chunk_limit - 1) / chunk_limit;
+    int32_t start = 0;
+    for (int32_t c = 0; c < num_chunks; ++c) {
+      int32_t end = std::min(start + chunk_limit, N);
+      int32_t chunk_sz = end - start;
+
+      // 步骤 1: chunk_sz 个 batch 行共享 request 行
+      for (int32_t p = 0; p < chunk_sz; ++p) {
+        pos_tensor.index<int32_t>(p) = start + p;
+        for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
+          model.single_req_block_table_host_[p * model.max_blocks_per_req_ + k] =
+              model.single_req_block_table_host_[saved_row * model.max_blocks_per_req_ + k];
+        }
       }
+
+      // 步骤 2: forward 本块的 token
+      std::vector<int32_t> chunk_tokens(tokens.begin() + start, tokens.begin() + end);
+      auto emb = model.embedding(chunk_tokens);
+      int dummy_next;
+      auto st = model.forward(emb.input_embeddings, pos_tensor, dummy_next);
+      if (!st) { LOG(FATAL) << "Prefill Forward Error: " << st.get_err_msg(); }
+      cudaDeviceSynchronize();
+
+      // 步骤 3: 保存 block 分配结果
+      for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
+        saved_block_table[saved_row * model.max_blocks_per_req_ + k] =
+            model.single_req_block_table_host_[0 * model.max_blocks_per_req_ + k];
+      }
+      // 下一块继续用更新后的 block_table
+      model.single_req_block_table_host_ = saved_block_table;
+
+      start = end;
     }
 
-    // 步骤 3: 设置位置数组 [0, 1, ..., N-1]
-    for (int32_t p = 0; p < N; ++p) {
-      pos_tensor.index<int32_t>(p) = p;
-    }
-
-    // 步骤 4: ★ 一次 forward，全部 N 个 prompt token
-    auto emb = model.embedding(tokens);
-    int dummy_next;
-    auto st = model.forward(emb.input_embeddings, pos_tensor, dummy_next);
-    if (!st) { LOG(FATAL) << "Prefill Forward Error: " << st.get_err_msg(); }
-    cudaDeviceSynchronize();
-
-    // 步骤 5: 保存 prefill 分配的 block 信息回 request 行
-    //   ensure_batch_blocks 修改了 batch 行 [0..N-1]，都等价于修改 request 行
-    for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
-      saved_block_table[req_row[r] * model.max_blocks_per_req_ + k] =
-          model.single_req_block_table_host_[k];  // row 0 == request row
-    }
-
-    // 步骤 6: 只采样最后一个 prompt token 位置
+    // 步骤 4: 只采样最后一个 prompt token
     tensor::Tensor forward_output = model.get_buffer(
         model::ModelBufferType::kForwardOutput);
-    const float* logits_N1 = forward_output.ptr<float>()
-                             + (N - 1) * vocab_size;
+    const float* logits_last = forward_output.ptr<float>()
+        + (std::min(chunk_limit, N) - 1) * vocab_size;
     int32_t next = static_cast<int32_t>(
-        kernel::argmax_kernel_cu(logits_N1, vocab_size, nullptr));
+        kernel::argmax_kernel_cu(logits_last, vocab_size, nullptr));
 
-    // 步骤 7: 更新状态 → 直接进入 decode
+    // 步骤 5: 切换到 decode
     int32_t rid = r;
     auto& req = scheduler.get_request(rid);
     req.pos = N;
@@ -268,9 +272,9 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
       scheduler.finish_request(rid, model.block_manager_);
     }
 
-    total_steps++;
-    printf("[Prefill] req %d: %d tokens → 1 forward (vs %d steps before)\n",
-           r, N, N);
+    total_steps += num_chunks;
+    printf("[Prefill] req %d: %d tokens → %d chunks (vs %d steps before)\n",
+           r, N, num_chunks, N);
   }
   fflush(stdout);
 
@@ -514,10 +518,9 @@ int main(int argc, char* argv[]) {
   }
   fflush(stdout);
 
-  // 3. 核心配置：max_batch_size_ 必须 ≥ max_prompt_len（prefill 批量需要）
-  //    init 之前设定，决定了 block_table 行数和 KV cache 池大小
-  //    设为 32 安全覆盖当前所有 prompt（最长 18 tokens + 并发 8）
-  model.max_batch_size_ = 32;
+  // 3. 核心配置：并发数 = prompt 数量
+  //    即使 prompt 比并发数长，prefill 优化用 chunked 方式处理
+  model.max_batch_size_ = sentences.size();
 
   // 4. 调用 init 申请底层 Paged KV Cache 和 Block Table
   auto init_status = model.init(base::DeviceType::kDeviceCUDA);
