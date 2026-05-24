@@ -255,11 +255,13 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
       start = end;
     }
 
-    // 步骤 4: 只采样最后一个 prompt token
+    // 步骤 4: 采样最后一个 prompt token（最后一块的最后一个位置）
     tensor::Tensor forward_output = model.get_buffer(
         model::ModelBufferType::kForwardOutput);
+    // 最后一块的大小 = N - (num_chunks-1) * chunk_limit
+    int32_t last_chunk_sz = N - (num_chunks - 1) * chunk_limit;
     const float* logits_last = forward_output.ptr<float>()
-        + (std::min(chunk_limit, N) - 1) * vocab_size;
+        + (last_chunk_sz - 1) * vocab_size;
     int32_t next = static_cast<int32_t>(
         kernel::argmax_kernel_cu(logits_last, vocab_size, nullptr));
 
