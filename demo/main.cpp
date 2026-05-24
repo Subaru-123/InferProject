@@ -546,8 +546,8 @@ int main(int argc, char* argv[]) {
   sentences.push_back("The capital of France is Paris. Paris is a beautiful city known for");
   sentences.push_back("What is the meaning of life? The answer to this question is");
   sentences.push_back("Tell me a short story about a brave knight.");
-  sentences.push_back("Prompt number 5 is a very nice prompt.");
-  sentences.push_back("In this paper, we propose a novel approach to");
+  sentences.push_back("Once upon a time, there was a little boy who loved to play outside.");
+  sentences.push_back("The little cat was hungry and looked for some food to eat.");
   sentences.push_back("The quick brown fox jumps over the lazy dog. This sentence contains every");
 
   printf("===== Prefill/Decode Separated Batch Inference =====\n");
