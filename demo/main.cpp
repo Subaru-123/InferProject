@@ -173,55 +173,43 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
   }
 
   tensor::Tensor pos_tensor = model.get_buffer(model::ModelBufferType::kInputPos);
-  auto& block_table_tensor = model.get_buffer(model::ModelBufferType::kBlockTable);
-  int32_t* table_ptr = const_cast<int32_t*>(block_table_tensor.ptr<int32_t>());
 
   int32_t total_steps = 0;
   bool has_pending = true;
 
   while (has_pending && total_steps < max_gen_steps * 2) {
     // ════════════════════════════════════════════════════════
-    // Phase 0: 调度 — 获取本轮活跃请求
+    // Phase 0: 调度
     // ════════════════════════════════════════════════════════
     auto step_batch = scheduler.schedule_step();
     int32_t cur_batch = step_batch.total_batch_size;
 
-    // 检查是否有等待中的请求或活跃请求
     has_pending = (!scheduler.waiting_queue_empty()
                    || scheduler.active_count() > 0);
     if (cur_batch == 0) {
       if (!has_pending) break;
-      // 活跃请求数为 0 但有等待请求 → 下步重新调度
       total_steps++;
       continue;
     }
 
-    // ── 为新准入的 prefill 请求分配 block ──
+    // ── 为新准入 prefill 请求重置 host-side block table 行 ──
+    //     注意: GPU block_table 不能通过 CPU 指针直接写入
+    //     块的实际分配由 ensure_batch_blocks (llama3.cpp) 按需完成
     for (int32_t s = 0; s < cur_batch; ++s) {
       int32_t rid = step_batch.active_indices[s];
       auto& req = scheduler.get_request(rid);
       if (req.status == ReqStatus::kPrefilling && req.block_ids.empty()) {
+        // 分配物理块（记录 ID，供 finish_request 回收）
         bool ok = scheduler.allocate_blocks(
             rid, model.block_manager_, model.block_size_, max_gen_steps);
         if (!ok) {
           LOG(WARNING) << "Failed to allocate blocks for req_id=" << rid;
-          // 退回等待队列（此处简化：直接标记完成）
           scheduler.finish_request(rid, model.block_manager_);
           continue;
         }
-        // 把 block_ids 写入 block_table 的对应行
-        int32_t row = s;
-        for (size_t k = 0; k < req.block_ids.size(); ++k) {
-          int32_t off = row * model.max_blocks_per_req_ + static_cast<int32_t>(k);
-          table_ptr[off] = req.block_ids[k];
-          model.single_req_block_table_host_[off] = req.block_ids[k];
-        }
-        // 初始化其余为 -1
-        for (int32_t k = static_cast<int32_t>(req.block_ids.size());
-             k < model.max_blocks_per_req_; ++k) {
-          int32_t off = row * model.max_blocks_per_req_ + k;
-          table_ptr[off] = -1;
-          model.single_req_block_table_host_[off] = -1;
+        // 重置 host-side block table（GPU 同步由 ensure_batch_blocks 处理）
+        for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
+          model.single_req_block_table_host_[s * model.max_blocks_per_req_ + k] = -1;
         }
       }
     }
