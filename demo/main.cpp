@@ -292,13 +292,16 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
       continue;
     }
 
-    // ★ 将每个活跃请求的 block_table 行映射到 batch slot
-    //   ensure_batch_blocks 按 slot 索引读取，需要正确的 block ID
+    // ★ batch slot ↔ request row 映射（防交叉污染）
+    //   保存当前全部行 → 映射 → forward → 写回 request 行 → 恢复其余行
+    auto decode_saved = model.single_req_block_table_host_;
+
     for (int32_t s = 0; s < cur_batch; ++s) {
       int32_t rid = step_batch.active_indices[s];
+      // 将 request 行映射到 batch slot 行
       for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
         model.single_req_block_table_host_[s * model.max_blocks_per_req_ + k] =
-            model.single_req_block_table_host_[rid * model.max_blocks_per_req_ + k];
+            decode_saved[rid * model.max_blocks_per_req_ + k];
       }
     }
 
@@ -318,15 +321,15 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
     if (!st) { LOG(FATAL) << "Forward Error: " << st.get_err_msg(); }
     cudaDeviceSynchronize();
 
-    // ★ 写回 block_table：ensure_batch_blocks 可能分配了新 block（在 slot 行）
-    //   需要同步回 request 行
+    // ★ 写回：只更新活跃 request 行，其余行保持不变
     for (int32_t s = 0; s < cur_batch; ++s) {
       int32_t rid = step_batch.active_indices[s];
       for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
-        model.single_req_block_table_host_[rid * model.max_blocks_per_req_ + k] =
+        decode_saved[rid * model.max_blocks_per_req_ + k] =
             model.single_req_block_table_host_[s * model.max_blocks_per_req_ + k];
       }
     }
+    model.single_req_block_table_host_ = decode_saved;
 
     // Scatter
     tensor::Tensor forward_output = model.get_buffer(
