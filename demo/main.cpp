@@ -518,18 +518,16 @@ int32_t generate_batch(const model::LLama2Model& model, const std::vector<std::s
 }
 
 int main(int argc, char* argv[]) {
-  if (argc != 3 && argc != 4) {
-    LOG(INFO) << "Usage: ./demo checkpoint_path tokenizer_path [--quant]";
+  if (argc < 3) {
+    printf("Usage: %s checkpoint_path tokenizer_path [--quant] [--old]\n", argv[0]);
+    printf("  --old  使用旧版 generate_batch_pd (无 prefill 优化, 用于对比)\n");
     return -1;
   }
   bool use_quant = false;
-  if (argc == 4) {
-    use_quant = (std::string(argv[3]) == "--quant");
-    if (!use_quant) {
-      LOG(INFO) << "Unknown option: " << argv[3];
-      LOG(INFO) << "Usage: ./demo checkpoint_path tokenizer_path [--quant]";
-      return -1;
-    }
+  bool use_old = false;
+  for (int i = 3; i < argc; ++i) {
+    if (std::string(argv[i]) == "--quant") use_quant = true;
+    if (std::string(argv[i]) == "--old") use_old = true;
   }
   const char* checkpoint_path = argv[1];  
   const char* tokenizer_path = argv[2];
@@ -577,8 +575,13 @@ int main(int argc, char* argv[]) {
 
   auto start = std::chrono::steady_clock::now();
 
-  // 5. ★ Scheduler 驱动的 P/D 分离推理
-  int total_generated = generate_batch_scheduled(model, sentences, 128, true);
+  // 5. 推理
+  int total_generated;
+  if (use_old) {
+    total_generated = generate_batch_pd(model, sentences, 128, true);
+  } else {
+    total_generated = generate_batch_scheduled(model, sentences, 128, true);
+  }
   
   auto end = std::chrono::steady_clock::now();
   auto duration = std::chrono::duration<double>(end - start).count();
