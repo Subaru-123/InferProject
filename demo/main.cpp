@@ -294,6 +294,18 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
     fflush(stdout);
   }
 
+  int64_t prompt_total = 0, gen_total = 0;
+  for (int32_t i = 0; i < (int32_t)sentences.size(); ++i) {
+    auto tok = model.encode(sentences[i]);
+    prompt_total += tok.size();
+    gen_total += generated_outputs[i].size();
+  }
+  printf("METRICS prompt_tokens_total=%lld gen_tokens_total=%lld total_tokens_total=%lld\n",
+         static_cast<long long>(prompt_total),
+         static_cast<long long>(gen_total),
+         static_cast<long long>(prompt_total + gen_total));
+  fflush(stdout);
+
   return total_steps * model.max_batch_size_;
 }
 
