@@ -448,8 +448,7 @@ int main(int argc, char* argv[]) {
 
   printf("===== Prefill/Decode Separated Batch Inference =====\n");
   for (int i = 0; i < (int)sentences.size(); ++i) {
-    printf("Prompt %d (len=%d): %s\n", i,
-           (int)model.encode(sentences[i]).size(), sentences[i].c_str());
+    printf("Prompt %d: %s\n", i, sentences[i].c_str());
   }
   fflush(stdout);
 
@@ -460,6 +459,12 @@ int main(int argc, char* argv[]) {
   auto init_status = model.init(base::DeviceType::kDeviceCUDA);
   if (!init_status) {
     LOG(FATAL) << "The model init failed: " << init_status.get_err_code();
+  }
+
+  // init 之后才能调用 encode，打印 prompt token 长度
+  for (int i = 0; i < (int)sentences.size(); ++i) {
+    printf("Prompt %d token_len=%d\n", i,
+           (int)model.encode(sentences[i]).size());
   }
 
   auto start = std::chrono::steady_clock::now();
