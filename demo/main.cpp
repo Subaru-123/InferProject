@@ -292,6 +292,10 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
   //   每个请求已在 prefill 阶段走完 prompt，现在各有一个 generated token
   //   剩余 decode: 每步各请求生成一个新 token
   // ════════════════════════════════════════════════════════════
+
+  // 全量同步 block_table 到 GPU（prefill 结束后的最终状态）
+  sync_block_table_to_gpu(model);
+
   has_pending = (scheduler.active_count() > 0);
 
   while (has_pending && total_steps < max_gen_steps * 2) {
