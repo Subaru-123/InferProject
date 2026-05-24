@@ -156,6 +156,15 @@ int32_t generate_batch_pd(const model::LLama2Model& model,
 //   2. batch 组成每步可变（请求完成 → 释放 slot → 新请求准入）
 //   3. block 通过 scheduler.allocate_blocks 预分配
 // ============================================================
+// [P/D-分离] 将 host block_table 同步到 GPU
+static void sync_block_table_to_gpu(model::LLama2Model& model) {
+  auto& bt = model.get_buffer(model::ModelBufferType::kBlockTable);
+  int32_t* gpu_ptr = const_cast<int32_t*>(bt.ptr<int32_t>());
+  size_t bytes = model.max_batch_size_ * model.max_blocks_per_req_ * sizeof(int32_t);
+  cudaMemcpy(gpu_ptr, model.single_req_block_table_host_.data(), bytes,
+             cudaMemcpyHostToDevice);
+}
+
 int32_t generate_batch_scheduled(model::LLama2Model& model,
                                  const std::vector<std::string>& sentences,
                                  int32_t max_gen_steps,
@@ -241,6 +250,7 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
       }
       // 下一块继续用更新后的 block_table
       model.single_req_block_table_host_ = saved_block_table;
+      sync_block_table_to_gpu(model);
 
       start = end;
     }
@@ -315,6 +325,7 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
     }
 
     // Forward
+    sync_block_table_to_gpu(model);
     auto emb = model.embedding(cur_tokens);
     int dummy_next;
     auto st = model.forward(emb.input_embeddings, pos_tensor, dummy_next);
@@ -330,6 +341,7 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
       }
     }
     model.single_req_block_table_host_ = decode_saved;
+    sync_block_table_to_gpu(model);
 
     // Scatter
     tensor::Tensor forward_output = model.get_buffer(
