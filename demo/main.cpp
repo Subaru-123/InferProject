@@ -174,14 +174,118 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
   }
 
   tensor::Tensor pos_tensor = model.get_buffer(model::ModelBufferType::kInputPos);
+  auto prev_block_table = model.single_req_block_table_host_;  // 保存初始状态
 
   int32_t total_steps = 0;
   bool has_pending = true;
 
+  // ════════════════════════════════════════════════════════════
+  // [Prefill优化] Phase A: 初始调度 — 准入所有请求并预分配 block
+  // ════════════════════════════════════════════════════════════
+  {
+    auto init_batch = scheduler.schedule_step();
+    for (int32_t s = 0; s < init_batch.total_batch_size; ++s) {
+      int32_t rid = init_batch.active_indices[s];
+      auto& req = scheduler.get_request(rid);
+      if (req.status == ReqStatus::kPrefilling && req.block_ids.empty()) {
+        scheduler.allocate_blocks(
+            rid, model.block_manager_, model.block_size_, max_gen_steps);
+        for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
+          model.single_req_block_table_host_[s * model.max_blocks_per_req_ + k] = -1;
+        }
+      }
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════
+  // [Prefill优化] Phase B: 批量 Prefill
+  //   每个请求的 N 个 prompt token 打包为一次 forward → 1 step 完成 prefill
+  //   block_table: N 个 batch 位置共享同一行（同一请求写入同一组物理块）
+  // ════════════════════════════════════════════════════════════
+  int32_t vocab_size = std::abs(model.config_->vocab_size_);
+  // 为每个请求分配专用 block_table 行（行号 = req index）
+  std::vector<int32_t> req_row(sentences.size(), -1);
+
+  for (int32_t r = 0; r < (int32_t)sentences.size(); ++r) {
+    auto tokens = model.encode(sentences[r]);
+    int32_t N = static_cast<int32_t>(tokens.size());
+    req_row[r] = r;  // 每个请求独占一行
+
+    // 保存除 prefill batch 之外的其他行
+    auto saved_block_table = model.single_req_block_table_host_;
+
+    // 步骤 1: 初始化该请求的 block_table 行（全 -1）
+    for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
+      model.single_req_block_table_host_[req_row[r] * model.max_blocks_per_req_ + k] = -1;
+    }
+
+    // 步骤 2: 将 request 行复制到 N 个 prefill batch 行
+    //   batch 行 [0..N-1] 全部指向和 request 行相同的物理块
+    for (int32_t p = 0; p < N; ++p) {
+      for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
+        model.single_req_block_table_host_[p * model.max_blocks_per_req_ + k] =
+            model.single_req_block_table_host_[req_row[r] * model.max_blocks_per_req_ + k];
+      }
+    }
+
+    // 步骤 3: 设置位置数组 [0, 1, ..., N-1]
+    for (int32_t p = 0; p < N; ++p) {
+      pos_tensor.index<int32_t>(p) = p;
+    }
+
+    // 步骤 4: ★ 一次 forward，全部 N 个 prompt token
+    auto emb = model.embedding(tokens);
+    int dummy_next;
+    auto st = model.forward(emb.input_embeddings, pos_tensor, dummy_next);
+    if (!st) { LOG(FATAL) << "Prefill Forward Error: " << st.get_err_msg(); }
+    cudaDeviceSynchronize();
+
+    // 步骤 5: 保存 prefill 分配的 block 信息回 request 行
+    //   ensure_batch_blocks 修改了 batch 行 [0..N-1]，都等价于修改 request 行
+    for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
+      saved_block_table[req_row[r] * model.max_blocks_per_req_ + k] =
+          model.single_req_block_table_host_[k];  // row 0 == request row
+    }
+
+    // 步骤 6: 只采样最后一个 prompt token 位置
+    tensor::Tensor forward_output = model.get_buffer(
+        model::ModelBufferType::kForwardOutput);
+    const float* logits_N1 = forward_output.ptr<float>()
+                             + (N - 1) * vocab_size;
+    int32_t next = static_cast<int32_t>(
+        kernel::argmax_kernel_cu(logits_N1, vocab_size, nullptr));
+
+    // 步骤 7: 更新状态 → 直接进入 decode
+    int32_t rid = r;
+    auto& req = scheduler.get_request(rid);
+    req.pos = N;
+    req.status = ReqStatus::kDecoding;
+    req.generated_ids.push_back(next);
+
+    if (model.is_sentence_ending(next)) {
+      int32_t pidx = req_id_to_prompt_idx[rid];
+      generated_outputs[pidx] = std::move(req.generated_ids);
+      scheduler.finish_request(rid, model.block_manager_);
+    }
+
+    total_steps++;
+    printf("[Prefill] req %d: %d tokens → 1 forward (vs %d steps before)\n",
+           r, N, N);
+  }
+  fflush(stdout);
+
+  // ════════════════════════════════════════════════════════════
+  // Phase C: Decode 主循环
+  //   每个请求已在 prefill 阶段走完 prompt，现在各有一个 generated token
+  //   剩余 decode: 每步各请求生成一个新 token
+  // ════════════════════════════════════════════════════════════
+  has_pending = (scheduler.active_count() > 0);
+
   while (has_pending && total_steps < max_gen_steps * 2) {
-    // ════════════════════════════════════════════════════════
-    // Phase 0: 调度
-    // ════════════════════════════════════════════════════════
+    // Restore block_table: 每个请求用自己独立的行
+    model.single_req_block_table_host_ = prev_block_table;
+
+    // 调度
     auto step_batch = scheduler.schedule_step();
     int32_t cur_batch = step_batch.total_batch_size;
 
@@ -193,71 +297,30 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
       continue;
     }
 
-    // ── 为新准入 prefill 请求重置 host-side block table 行 ──
-    //     注意: GPU block_table 不能通过 CPU 指针直接写入
-    //     块的实际分配由 ensure_batch_blocks (llama3.cpp) 按需完成
-    for (int32_t s = 0; s < cur_batch; ++s) {
-      int32_t rid = step_batch.active_indices[s];
-      auto& req = scheduler.get_request(rid);
-      if (req.status == ReqStatus::kPrefilling && req.block_ids.empty()) {
-        // 分配物理块（记录 ID，供 finish_request 回收）
-        bool ok = scheduler.allocate_blocks(
-            rid, model.block_manager_, model.block_size_, max_gen_steps);
-        if (!ok) {
-          LOG(WARNING) << "Failed to allocate blocks for req_id=" << rid;
-          scheduler.finish_request(rid, model.block_manager_);
-          continue;
-        }
-        // 重置 host-side block table（GPU 同步由 ensure_batch_blocks 处理）
-        for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
-          model.single_req_block_table_host_[s * model.max_blocks_per_req_ + k] = -1;
-        }
-      }
-    }
-
-    // ════════════════════════════════════════════════════════
-    // Phase 1: Gather
-    // ════════════════════════════════════════════════════════
+    // Gather: 所有请求已在 decode 阶段
     std::vector<int32_t> cur_tokens(cur_batch);
     for (int32_t s = 0; s < cur_batch; ++s) {
       int32_t rid = step_batch.active_indices[s];
       auto& req = scheduler.get_request(rid);
-
       pos_tensor.index<int32_t>(s) = req.pos;
-
-      if (req.status == ReqStatus::kPrefilling) {
-        cur_tokens[s] = req.prompt_tokens[req.pos];
-      } else {
-        cur_tokens[s] = req.generated_ids.back();
-      }
+      cur_tokens[s] = req.generated_ids.back();
     }
 
-    // ════════════════════════════════════════════════════════
-    // Phase 2: Forward
-    // ════════════════════════════════════════════════════════
+    // Forward
     auto emb = model.embedding(cur_tokens);
     int dummy_next;
     auto st = model.forward(emb.input_embeddings, pos_tensor, dummy_next);
     if (!st) { LOG(FATAL) << "Forward Error: " << st.get_err_msg(); }
     cudaDeviceSynchronize();
 
-    // ════════════════════════════════════════════════════════
-    // Phase 3: Scatter
-    // ════════════════════════════════════════════════════════
+    // Scatter
     tensor::Tensor forward_output = model.get_buffer(
         model::ModelBufferType::kForwardOutput);
-    int32_t vocab_size = std::abs(model.config_->vocab_size_);
     const float* device_logits = forward_output.ptr<float>();
 
     for (int32_t s = 0; s < cur_batch; ++s) {
       int32_t rid = step_batch.active_indices[s];
       auto& req = scheduler.get_request(rid);
-
-      if (req.status == ReqStatus::kPrefilling
-          && req.pos < req.prompt_len - 1) {
-        req.pos++;
-        continue;
-      }
 
       const float* b_logits = device_logits + s * vocab_size;
       int32_t next = static_cast<int32_t>(
@@ -265,12 +328,6 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
       req.generated_ids.push_back(next);
       req.pos++;
 
-      // Prefill → Decode 切换
-      if (req.status == ReqStatus::kPrefilling) {
-        req.status = ReqStatus::kDecoding;
-      }
-
-      // 终止或达上限 → 保存结果再释放
       if (model.is_sentence_ending(next)
           || static_cast<int32_t>(req.generated_ids.size()) >= max_gen_steps) {
         int32_t pidx = req_id_to_prompt_idx[rid];
@@ -457,8 +514,16 @@ int main(int argc, char* argv[]) {
   }
   fflush(stdout);
 
-  // 3. 核心配置：最大并发数 = prompt 数量
-  model.max_batch_size_ = sentences.size();
+  // 3. 核心配置：batch_size = max(并发数, 最长 prompt token 数)
+  //    因为 prefill 优化需要将全部 prompt token 作为一次 batch 处理
+  {
+    int32_t max_prompt_len = 0;
+    for (auto& s : sentences) {
+      max_prompt_len = std::max(max_prompt_len,
+                                (int32_t)model.encode(s).size());
+    }
+    model.max_batch_size_ = std::max((int32_t)sentences.size(), max_prompt_len);
+  }
 
   // 4. 调用 init 申请底层 Paged KV Cache 和 Block Table
   auto init_status = model.init(base::DeviceType::kDeviceCUDA);
