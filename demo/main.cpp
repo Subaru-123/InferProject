@@ -1,10 +1,12 @@
 #include <base/base.h>
 #include <base/tick.h>
+#include <base/scheduler.h>
 #include <glog/logging.h>
 #include "model/llama3.h"
 #include <vector>
 #include <string>
 #include <chrono>
+#include <unordered_map>
 #include "../kuiper/source/op/kernels/cuda/argmax_kernel.cuh"
 
 // ============================================================
@@ -143,6 +145,163 @@ int32_t generate_batch_pd(const model::LLama2Model& model,
   fflush(stdout);
 
   return total_steps * batch_size;
+}
+
+
+// ============================================================
+// [P/D-分离] Scheduler 驱动的 Continuous Batching 推理
+//
+// 与 generate_batch_pd 的核心区别:
+//   1. 请求由 Scheduler 管理（可以中途动态提交新请求）
+//   2. batch 组成每步可变（请求完成 → 释放 slot → 新请求准入）
+//   3. block 通过 scheduler.allocate_blocks 预分配
+// ============================================================
+int32_t generate_batch_scheduled(model::LLama2Model& model,
+                                 const std::vector<std::string>& sentences,
+                                 int32_t max_gen_steps,
+                                 bool need_output = false) {
+  Scheduler scheduler;
+  scheduler.max_active_requests_ = model.max_batch_size_;
+  scheduler.max_prefill_tokens_per_step_ = 2048;
+
+  // ── 提交所有请求到调度器 ──
+  std::unordered_map<int32_t, int32_t> req_id_to_prompt_idx;
+  for (int32_t i = 0; i < (int32_t)sentences.size(); ++i) {
+    auto tokens = model.encode(sentences[i]);
+    int32_t rid = scheduler.submit(tokens, max_gen_steps);
+    req_id_to_prompt_idx[rid] = i;
+  }
+
+  tensor::Tensor pos_tensor = model.get_buffer(model::ModelBufferType::kInputPos);
+  auto& block_table_tensor = model.get_buffer(model::ModelBufferType::kBlockTable);
+  int32_t* table_ptr = const_cast<int32_t*>(block_table_tensor.ptr<int32_t>());
+
+  int32_t total_steps = 0;
+  bool has_pending = true;
+
+  while (has_pending && total_steps < max_gen_steps * 2) {
+    // ════════════════════════════════════════════════════════
+    // Phase 0: 调度 — 获取本轮活跃请求
+    // ════════════════════════════════════════════════════════
+    auto step_batch = scheduler.schedule_step();
+    int32_t cur_batch = step_batch.total_batch_size;
+
+    // 检查是否有等待中的请求或活跃请求
+    has_pending = (!scheduler.waiting_queue_empty()
+                   || scheduler.active_count() > 0);
+    if (cur_batch == 0) {
+      if (!has_pending) break;
+      // 活跃请求数为 0 但有等待请求 → 下步重新调度
+      total_steps++;
+      continue;
+    }
+
+    // ── 为新准入的 prefill 请求分配 block ──
+    for (int32_t s = 0; s < cur_batch; ++s) {
+      int32_t rid = step_batch.active_indices[s];
+      auto& req = scheduler.get_request(rid);
+      if (req.status == ReqStatus::kPrefilling && req.block_ids.empty()) {
+        bool ok = scheduler.allocate_blocks(
+            rid, model.block_manager_, model.block_size_, max_gen_steps);
+        if (!ok) {
+          LOG(WARNING) << "Failed to allocate blocks for req_id=" << rid;
+          // 退回等待队列（此处简化：直接标记完成）
+          scheduler.finish_request(rid, model.block_manager_);
+          continue;
+        }
+        // 把 block_ids 写入 block_table 的对应行
+        int32_t row = s;
+        for (size_t k = 0; k < req.block_ids.size(); ++k) {
+          int32_t off = row * model.max_blocks_per_req_ + static_cast<int32_t>(k);
+          table_ptr[off] = req.block_ids[k];
+          model.single_req_block_table_host_[off] = req.block_ids[k];
+        }
+        // 初始化其余为 -1
+        for (int32_t k = static_cast<int32_t>(req.block_ids.size());
+             k < model.max_blocks_per_req_; ++k) {
+          int32_t off = row * model.max_blocks_per_req_ + k;
+          table_ptr[off] = -1;
+          model.single_req_block_table_host_[off] = -1;
+        }
+      }
+    }
+
+    // ════════════════════════════════════════════════════════
+    // Phase 1: Gather
+    // ════════════════════════════════════════════════════════
+    std::vector<int32_t> cur_tokens(cur_batch);
+    for (int32_t s = 0; s < cur_batch; ++s) {
+      int32_t rid = step_batch.active_indices[s];
+      auto& req = scheduler.get_request(rid);
+
+      pos_tensor.index<int32_t>(s) = req.pos;
+
+      if (req.status == ReqStatus::kPrefilling) {
+        cur_tokens[s] = req.prompt_tokens[req.pos];
+      } else {
+        cur_tokens[s] = req.generated_ids.back();
+      }
+    }
+
+    // ════════════════════════════════════════════════════════
+    // Phase 2: Forward
+    // ════════════════════════════════════════════════════════
+    auto emb = model.embedding(cur_tokens);
+    int dummy_next;
+    auto st = model.forward(emb.input_embeddings, pos_tensor, dummy_next);
+    if (!st) { LOG(FATAL) << "Forward Error: " << st.get_err_msg(); }
+    cudaDeviceSynchronize();
+
+    // ════════════════════════════════════════════════════════
+    // Phase 3: Scatter
+    // ════════════════════════════════════════════════════════
+    tensor::Tensor forward_output = model.get_buffer(
+        model::ModelBufferType::kForwardOutput);
+    int32_t vocab_size = std::abs(model.config_->vocab_size_);
+    const float* device_logits = forward_output.ptr<float>();
+
+    for (int32_t s = 0; s < cur_batch; ++s) {
+      int32_t rid = step_batch.active_indices[s];
+      auto& req = scheduler.get_request(rid);
+
+      if (req.status == ReqStatus::kPrefilling
+          && req.pos < req.prompt_len - 1) {
+        req.pos++;
+        continue;
+      }
+
+      const float* b_logits = device_logits + s * vocab_size;
+      int32_t next = static_cast<int32_t>(
+          kernel::argmax_kernel_cu(b_logits, vocab_size, nullptr));
+      req.generated_ids.push_back(next);
+      req.pos++;
+
+      // Prefill → Decode 切换
+      if (req.status == ReqStatus::kPrefilling) {
+        req.status = ReqStatus::kDecoding;
+      }
+
+      // 终止或达上限
+      if (model.is_sentence_ending(next)
+          || static_cast<int32_t>(req.generated_ids.size()) >= max_gen_steps) {
+        scheduler.finish_request(rid, model.block_manager_);
+      }
+    }
+
+    total_steps++;
+  }
+
+  // ── 输出（按 prompt 索引查找结果） ──
+  if (need_output) {
+    for (int32_t i = 0; i < (int32_t)sentences.size(); ++i) {
+      printf("\n==================================\n");
+      printf("Prompt %d: %s\n", i, sentences[i].c_str());
+      printf("==================================\n");
+    }
+    fflush(stdout);
+  }
+
+  return total_steps * model.max_batch_size_;
 }
 
 
@@ -305,8 +464,8 @@ int main(int argc, char* argv[]) {
 
   auto start = std::chrono::steady_clock::now();
 
-  // 5. ★ P/D 分离推理
-  int total_generated = generate_batch_pd(model, sentences, 128, true);
+  // 5. ★ Scheduler 驱动的 P/D 分离推理
+  int total_generated = generate_batch_scheduled(model, sentences, 128, true);
   
   auto end = std::chrono::steady_clock::now();
   auto duration = std::chrono::duration<double>(end - start).count();

@@ -1,3 +1,8 @@
+#include <base/block_manager.h>
+#include <deque>
+#include <unordered_map>
+#include <vector>
+
 enum class ReqStatus { kWaiting, kPrefilling, kDecoding, kFinished };
 
 struct ScheduleRequest {
@@ -27,12 +32,25 @@ public:
     StepBatch schedule_step();
 
     // 标记请求完成，释放其占用的 blocks
-    void finish_request(int32_t req_id, BlockManager& block_manager);
+    void finish_request(int32_t req_id, base::BlockManager& block_manager);
+
+    // [P/D-分离] 访问器 — 主循环通过这些方法读写请求状态
+    ScheduleRequest& get_request(int32_t req_id);
+    bool waiting_queue_empty() const;
+    int32_t waiting_queue_size() const;
+    int32_t active_count() const;
+
+    // [P/D-分离] 为新准入的 prefill 请求分配物理块
+    // 返回 false 表示块池不足，该请求应退回等待队列
+    bool allocate_blocks(int32_t req_id, base::BlockManager& block_manager,
+                         int32_t block_size, int32_t max_gen_steps);
+
+    // 调度器参数（公开，允许外部按需调整）
+    int32_t max_active_requests_ = 64;
+    int32_t max_prefill_tokens_per_step_ = 2048;  // 单步最多处理多少 prefill token
 
 private:
     std::deque<ScheduleRequest> waiting_queue_;   // 等待队列
     std::unordered_map<int32_t, ScheduleRequest> active_requests_;  // 活跃请求
-    int32_t max_active_requests_ = 64;
-    int32_t max_prefill_tokens_per_step_ = 2048;  // 单步最多处理多少 prefill token
     int32_t next_req_id_ = 0;
 };

@@ -116,3 +116,57 @@ void Scheduler::finish_request(int32_t req_id,
             << " (active=" << active_requests_.size()
             << ", waiting=" << waiting_queue_.size() << ")";
 }
+
+// ============================================================
+// [P/D-分离] 访问器
+// ============================================================
+ScheduleRequest& Scheduler::get_request(int32_t req_id) {
+  auto it = active_requests_.find(req_id);
+  CHECK(it != active_requests_.end())
+      << "req_id=" << req_id << " not in active set";
+  return it->second;
+}
+
+bool Scheduler::waiting_queue_empty() const {
+  return waiting_queue_.empty();
+}
+
+int32_t Scheduler::waiting_queue_size() const {
+  return static_cast<int32_t>(waiting_queue_.size());
+}
+
+int32_t Scheduler::active_count() const {
+  return static_cast<int32_t>(active_requests_.size());
+}
+
+// ============================================================
+// [P/D-分离] 为新准入的 prefill 请求预分配物理块
+// ============================================================
+bool Scheduler::allocate_blocks(int32_t req_id,
+                                base::BlockManager& block_manager,
+                                int32_t block_size,
+                                int32_t max_gen_steps) {
+  auto it = active_requests_.find(req_id);
+  if (it == active_requests_.end()) return false;
+
+  auto& req = it->second;
+  // 需要块数 = ceil((prompt_len + max_gen_len) / block_size)
+  int32_t total_tokens = req.prompt_len + max_gen_steps;
+  int32_t blocks_needed = (total_tokens + block_size - 1) / block_size;
+
+  if (block_manager.free_block_count() < blocks_needed) {
+    LOG(WARNING) << "[Scheduler] not enough free blocks for req_id=" << req_id
+                 << " need=" << blocks_needed
+                 << " free=" << block_manager.free_block_count();
+    return false;
+  }
+
+  req.block_ids.clear();
+  for (int32_t i = 0; i < blocks_needed; ++i) {
+    req.block_ids.push_back(block_manager.allocate_block());
+  }
+
+  LOG(INFO) << "[Scheduler] allocated " << blocks_needed
+            << " blocks for req_id=" << req_id;
+  return true;
+}
