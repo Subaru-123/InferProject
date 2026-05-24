@@ -226,9 +226,19 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
       int32_t end = std::min(start + chunk_limit, N);
       int32_t chunk_sz = end - start;
 
-      // 步骤 1: chunk_sz 个 batch 行共享 request 行
+      // 步骤 1: 确保 chunk 内所有位置共享相同的物理块
+      //   先检查哪些逻辑块需要新物理块，统一分配后写入所有 batch row
       for (int32_t p = 0; p < chunk_sz; ++p) {
         pos_tensor.index<int32_t>(p) = start + p;
+        int32_t pos = start + p;
+        int32_t logical_blk = pos / model.block_size_;
+        int32_t blk = model.single_req_block_table_host_[saved_row * model.max_blocks_per_req_ + logical_blk];
+        if (blk < 0) {
+          blk = model.block_manager_.allocate_block();
+          // 写入 request row
+          model.single_req_block_table_host_[saved_row * model.max_blocks_per_req_ + logical_blk] = blk;
+        }
+        // 将 request row 的数据复制到所有 batch row
         for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
           model.single_req_block_table_host_[p * model.max_blocks_per_req_ + k] =
               model.single_req_block_table_host_[saved_row * model.max_blocks_per_req_ + k];
@@ -246,12 +256,17 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
       if (!st) { LOG(FATAL) << "Prefill Forward Error: " << st.get_err_msg(); }
       cudaDeviceSynchronize();
 
-      // 步骤 3: 保存 block 分配结果
-      for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
-        saved_block_table[saved_row * model.max_blocks_per_req_ + k] =
-            model.single_req_block_table_host_[0 * model.max_blocks_per_req_ + k];
+      // 步骤 3: 合并所有 batch row 的 block ID 到 request row
+      //   ensure_batch_blocks 独立分配每个 batch slot 的块
+      //   需要将分散的块收集到同一个 request row
+      for (int32_t p = 0; p < chunk_sz; ++p) {
+        for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
+          int32_t blk = model.single_req_block_table_host_[p * model.max_blocks_per_req_ + k];
+          if (blk >= 0) {
+            saved_block_table[saved_row * model.max_blocks_per_req_ + k] = blk;
+          }
+        }
       }
-      // 下一块继续用更新后的 block_table
       model.single_req_block_table_host_ = saved_block_table;
       sync_block_table_to_gpu(model);
 
