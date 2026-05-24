@@ -514,16 +514,10 @@ int main(int argc, char* argv[]) {
   }
   fflush(stdout);
 
-  // 3. 核心配置：batch_size = max(并发数, 最长 prompt token 数)
-  //    因为 prefill 优化需要将全部 prompt token 作为一次 batch 处理
-  {
-    int32_t max_prompt_len = 0;
-    for (auto& s : sentences) {
-      max_prompt_len = std::max(max_prompt_len,
-                                (int32_t)model.encode(s).size());
-    }
-    model.max_batch_size_ = std::max((int32_t)sentences.size(), max_prompt_len);
-  }
+  // 3. 核心配置：max_batch_size_ 必须 ≥ max_prompt_len（prefill 批量需要）
+  //    init 之前设定，决定了 block_table 行数和 KV cache 池大小
+  //    设为 32 安全覆盖当前所有 prompt（最长 18 tokens + 并发 8）
+  model.max_batch_size_ = 32;
 
   // 4. 调用 init 申请底层 Paged KV Cache 和 Block Table
   auto init_status = model.init(base::DeviceType::kDeviceCUDA);
@@ -531,7 +525,6 @@ int main(int argc, char* argv[]) {
     LOG(FATAL) << "The model init failed: " << init_status.get_err_code();
   }
 
-  // init 之后才能调用 encode，打印 prompt token 长度
   for (int i = 0; i < (int)sentences.size(); ++i) {
     printf("Prompt %d token_len=%d\n", i,
            (int)model.encode(sentences[i]).size());
