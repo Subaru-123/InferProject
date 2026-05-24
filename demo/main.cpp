@@ -180,21 +180,15 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
   bool has_pending = true;
 
   // ════════════════════════════════════════════════════════════
-  // [Prefill优化] Phase A: 初始调度 — 准入所有请求并预分配 block
+  // Phase A: 初始调度 — 准入所有请求（block 由 ensure_batch_blocks 按需分配）
   // ════════════════════════════════════════════════════════════
   {
     auto init_batch = scheduler.schedule_step();
-    for (int32_t s = 0; s < init_batch.total_batch_size; ++s) {
-      int32_t rid = init_batch.active_indices[s];
-      auto& req = scheduler.get_request(rid);
-      if (req.status == ReqStatus::kPrefilling && req.block_ids.empty()) {
-        scheduler.allocate_blocks(
-            rid, model.block_manager_, model.block_size_, max_gen_steps);
-        for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
-          model.single_req_block_table_host_[s * model.max_blocks_per_req_ + k] = -1;
-        }
-      }
-    }
+    // 重置所有 block_table 行为 -1
+    model.single_req_block_table_host_.assign(
+        model.max_batch_size_ * model.max_blocks_per_req_, -1);
+    printf("[Init] admitted %d requests, block_pool=%d blocks\n",
+           init_batch.total_batch_size, model.block_manager_.total_blocks());
   }
 
   // ════════════════════════════════════════════════════════════
@@ -286,9 +280,6 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
   has_pending = (scheduler.active_count() > 0);
 
   while (has_pending && total_steps < max_gen_steps * 2) {
-    // Restore block_table: 每个请求用自己独立的行
-    model.single_req_block_table_host_ = prev_block_table;
-
     // 调度
     auto step_batch = scheduler.schedule_step();
     int32_t cur_batch = step_batch.total_batch_size;
@@ -301,7 +292,17 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
       continue;
     }
 
-    // Gather: 所有请求已在 decode 阶段
+    // ★ 将每个活跃请求的 block_table 行映射到 batch slot
+    //   ensure_batch_blocks 按 slot 索引读取，需要正确的 block ID
+    for (int32_t s = 0; s < cur_batch; ++s) {
+      int32_t rid = step_batch.active_indices[s];
+      for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
+        model.single_req_block_table_host_[s * model.max_blocks_per_req_ + k] =
+            model.single_req_block_table_host_[rid * model.max_blocks_per_req_ + k];
+      }
+    }
+
+    // Gather
     std::vector<int32_t> cur_tokens(cur_batch);
     for (int32_t s = 0; s < cur_batch; ++s) {
       int32_t rid = step_batch.active_indices[s];
@@ -316,6 +317,16 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
     auto st = model.forward(emb.input_embeddings, pos_tensor, dummy_next);
     if (!st) { LOG(FATAL) << "Forward Error: " << st.get_err_msg(); }
     cudaDeviceSynchronize();
+
+    // ★ 写回 block_table：ensure_batch_blocks 可能分配了新 block（在 slot 行）
+    //   需要同步回 request 行
+    for (int32_t s = 0; s < cur_batch; ++s) {
+      int32_t rid = step_batch.active_indices[s];
+      for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
+        model.single_req_block_table_host_[rid * model.max_blocks_per_req_ + k] =
+            model.single_req_block_table_host_[s * model.max_blocks_per_req_ + k];
+      }
+    }
 
     // Scatter
     tensor::Tensor forward_output = model.get_buffer(
@@ -334,6 +345,13 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
 
       if (model.is_sentence_ending(next)
           || static_cast<int32_t>(req.generated_ids.size()) >= max_gen_steps) {
+        // 收集该请求占用的物理块
+        //   初始 batch 中 req_id == block_table 行号
+        int32_t row = rid;
+        for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
+          int32_t blk = model.single_req_block_table_host_[row * model.max_blocks_per_req_ + k];
+          if (blk >= 0) req.block_ids.push_back(blk);
+        }
         int32_t pidx = req_id_to_prompt_idx[rid];
         generated_outputs[pidx] = std::move(req.generated_ids);
         scheduler.finish_request(rid, model.block_manager_);
