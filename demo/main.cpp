@@ -7,6 +7,148 @@
 #include <chrono>
 #include "../kuiper/source/op/kernels/cuda/argmax_kernel.cuh"
 
+// ============================================================
+// [P/D-分离] Per-request state — 每个请求独立跟踪位置和阶段
+// ============================================================
+struct ReqState {
+  int32_t req_id;
+  std::vector<int32_t> prompt_tokens;    // 完整 prompt token 列表
+  std::vector<int32_t> generated_tokens; // 已生成的 token
+  int32_t prompt_len;
+  int32_t pos = 0;          // ★ 请求自己的当前处理位置（不再共享全局 pos）
+  bool is_prefill = true;   // ★ true=预填充阶段, false=逐token解码阶段
+  bool is_finished = false;
+};
+
+// ============================================================
+// [P/D-分离] Prefill/Decode 分离版批量推理
+//
+// 与旧版核心区别：
+//   1. pos 不再全局共享 → 每个 ReqState 独立维护
+//   2. prefill 阶段走完所有 prompt token 之前不采样（teacher forcing）
+//   3. 最后一个 prompt token 处理后采样一次，切换到 decode 阶段
+//   4. decode 阶段每步采样一次，直到生成终止符
+// ============================================================
+int32_t generate_batch_pd(const model::LLama2Model& model,
+                          const std::vector<std::string>& sentences,
+                          int32_t max_gen_steps, bool need_output = false) {
+  int32_t batch_size = sentences.size();
+  std::vector<ReqState> reqs(batch_size);
+
+  // ── 编码所有 prompt ──
+  for (int32_t i = 0; i < batch_size; ++i) {
+    reqs[i].req_id = i;
+    reqs[i].prompt_tokens = model.encode(sentences[i]);
+    reqs[i].prompt_len = reqs[i].prompt_tokens.size();
+  }
+
+  tensor::Tensor pos_tensor = model.get_buffer(model::ModelBufferType::kInputPos);
+  int32_t total_steps = 0;
+  bool has_active = true;
+
+  while (has_active && total_steps < max_gen_steps * 2) {
+    has_active = false;
+
+    // ════════════════════════════════════════════════════════
+    // Phase 1: Gather — 根据 prefill/decode 状态选择输入 token
+    // ════════════════════════════════════════════════════════
+    std::vector<int32_t> cur_tokens(batch_size);
+    for (int32_t b = 0; b < batch_size; ++b) {
+      if (reqs[b].is_finished) {
+        cur_tokens[b] = 0;            // padding token
+        pos_tensor.index<int32_t>(b) = 0;
+        continue;
+      }
+      has_active = true;
+
+      // ★ 关键：每个请求设置自己的独立位置
+      pos_tensor.index<int32_t>(b) = reqs[b].pos;
+
+      if (reqs[b].is_prefill) {
+        // Prefill: 来源 = prompt_tokens[当前pos]
+        cur_tokens[b] = reqs[b].prompt_tokens[reqs[b].pos];
+      } else {
+        // Decode: 来源 = 上一轮生成的最后一个 token
+        cur_tokens[b] = reqs[b].generated_tokens.back();
+      }
+    }
+    if (!has_active) break;
+
+    // ════════════════════════════════════════════════════════
+    // Phase 2: Forward — prefill 和 decode 共用同一个 forward
+    // ════════════════════════════════════════════════════════
+    auto emb = model.embedding(cur_tokens);
+    int dummy_next;
+    auto st = model.forward(emb.input_embeddings, pos_tensor, dummy_next);
+    if (!st) { LOG(FATAL) << "Forward Error: " << st.get_err_msg(); }
+    cudaDeviceSynchronize();
+
+    // ════════════════════════════════════════════════════════
+    // Phase 3: Scatter — 只在需要的时候采样
+    // ════════════════════════════════════════════════════════
+    tensor::Tensor forward_output = model.get_buffer(
+        model::ModelBufferType::kForwardOutput);
+    int32_t vocab_size = std::abs(model.config_->vocab_size_);
+    const float* device_logits = forward_output.ptr<float>();
+
+    for (int32_t b = 0; b < batch_size; ++b) {
+      if (reqs[b].is_finished) continue;
+
+      if (reqs[b].is_prefill && reqs[b].pos < reqs[b].prompt_len - 1) {
+        // ── Prefill 中间步：不采样，pos+1 继续 teacher forcing ──
+        reqs[b].pos++;
+        continue;
+      }
+
+      // ── Prefill 最后一步 / Decode 步：GPU argmax 采样 ──
+      const float* b_logits = device_logits + b * vocab_size;
+      int32_t next = static_cast<int32_t>(
+          kernel::argmax_kernel_cu(b_logits, vocab_size, nullptr));
+      reqs[b].generated_tokens.push_back(next);
+      reqs[b].pos++;
+
+      // Prefill → Decode 切换
+      if (reqs[b].is_prefill) {
+        reqs[b].is_prefill = false;
+      }
+
+      if (model.is_sentence_ending(next)) {
+        reqs[b].is_finished = true;
+      }
+    }
+    total_steps++;
+  }
+
+  // ── 输出 ──
+  if (need_output) {
+    for (int32_t b = 0; b < batch_size; ++b) {
+      printf("\n==================================\n");
+      printf("Prompt %d: %s\n", b, sentences[b].c_str());
+      printf("Output %d: %s%s\n", b, sentences[b].c_str(),
+             model.decode(reqs[b].generated_tokens).data());
+      printf("==================================\n");
+    }
+    fflush(stdout);
+  }
+
+  int64_t prompt_total = 0, gen_total = 0;
+  for (int32_t b = 0; b < batch_size; ++b) {
+    prompt_total += reqs[b].prompt_len;
+    gen_total += reqs[b].generated_tokens.size();
+  }
+  printf("METRICS prompt_tokens_total=%lld gen_tokens_total=%lld total_tokens_total=%lld\n",
+         static_cast<long long>(prompt_total),
+         static_cast<long long>(gen_total),
+         static_cast<long long>(prompt_total + gen_total));
+  fflush(stdout);
+
+  return total_steps * batch_size;
+}
+
+
+// ============================================================
+// 旧版静态批量推理（保留，用于对比）
+// ============================================================
 int32_t generate_batch(const model::LLama2Model& model, const std::vector<std::string>& sentences,
                        int32_t total_steps, bool need_output = false) {
   int32_t batch_size = sentences.size();
@@ -133,30 +275,38 @@ int main(int argc, char* argv[]) {
   // 1. 初始化模型类
   model::LLama2Model model(base::TokenizerType::kEncodeSpe, tokenizer_path, checkpoint_path, use_quant);
 
-  // 2. 准备你想并发测试的任意多条句子 (例如 6 条)
-    std::vector<std::string> sentences;
-  for (int i = 0; i < 20; ++i) {
-      sentences.push_back("Prompt number " + std::to_string(i) + " is a very nice prompt.");
+  // 2. 使用不等长 prompt 体现 P/D 分离价值
+  //    不同 prompt 长度不同 → prefill 步数不同 → 各自独立切换 decode
+  std::vector<std::string> sentences;
+  sentences.push_back("Hello, who are you?");
+  sentences.push_back("Once upon a time, there was a little girl who lived in a small village.");
+  sentences.push_back("The capital of France is Paris. Paris is a beautiful city known for");
+  sentences.push_back("What is the meaning of life? The answer to this question is");
+  sentences.push_back("Tell me a short story about a brave knight.");
+  sentences.push_back("Prompt number 5 is a very nice prompt.");
+  sentences.push_back("In this paper, we propose a novel approach to");
+  sentences.push_back("The quick brown fox jumps over the lazy dog. This sentence contains every");
+
+  printf("===== Prefill/Decode Separated Batch Inference =====\n");
+  for (int i = 0; i < (int)sentences.size(); ++i) {
+    printf("Prompt %d (len=%d): %s\n", i,
+           (int)model.encode(sentences[i]).size(), sentences[i].c_str());
   }
+  fflush(stdout);
 
-  // 3. 【核心配置】：在模型分配显存 (init) 前，告诉它我们要跑的最大并发数！
-  model.max_batch_size_ = sentences.size(); 
+  // 3. 核心配置：最大并发数 = prompt 数量
+  model.max_batch_size_ = sentences.size();
 
-  // 4. 调用 init 申请底层 Paged KV Cache、Block Table 和 QKV 缓存
+  // 4. 调用 init 申请底层 Paged KV Cache 和 Block Table
   auto init_status = model.init(base::DeviceType::kDeviceCUDA);
   if (!init_status) {
     LOG(FATAL) << "The model init failed: " << init_status.get_err_code();
   }
 
   auto start = std::chrono::steady_clock::now();
-  printf("Generating Batch (Size %d)...\n", (int)sentences.size());
-  for(int i=0;i<sentences.size();i++) {
-      printf("Prompt %d len: %d\n", i, (int)model.encode(sentences[i]).size());
-  }
-  fflush(stdout);
-  
-  // 5. 启动 Continuous Batching 推理
-  int total_generated = generate_batch(model, sentences, 128, true);
+
+  // 5. ★ P/D 分离推理
+  int total_generated = generate_batch_pd(model, sentences, 128, true);
   
   auto end = std::chrono::steady_clock::now();
   auto duration = std::chrono::duration<double>(end - start).count();
