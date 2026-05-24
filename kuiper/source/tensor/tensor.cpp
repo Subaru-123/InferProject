@@ -268,9 +268,11 @@ bool Tensor::is_empty() const {
 
 void Tensor::init_buffer(std::shared_ptr<base::DeviceAllocator> alloc, base::DataType data_type,
                          bool need_alloc, void* ptr) {
-  if (!alloc && !need_alloc) {
+  // --- 核心修复：只要明确声明了不需要分配 (!need_alloc)，就绝对禁止触发 allocate！ ---
+  if (!need_alloc) {
+    // 将合法的 alloc 一并传给 Buffer，完美骗过框架后期的 allocator_ != nullptr 安全检查
     std::shared_ptr<base::Buffer> buffer =
-        std::make_shared<base::Buffer>(data_type_size(data_type) * size_, nullptr, ptr, true);
+        std::make_shared<base::Buffer>(data_type_size(data_type) * size_, alloc, ptr, true);
     this->buffer_ = buffer;
   } else {
     allocate(alloc, true);

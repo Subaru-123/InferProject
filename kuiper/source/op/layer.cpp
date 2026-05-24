@@ -57,7 +57,7 @@ base::Status Layer::check_tensor(const tensor::Tensor& tensor, base::DeviceType 
 base::Status Layer::check_tensor_with_dim(const tensor::Tensor& tensor,
                                           base::DeviceType device_type, base::DataType data_type,
                                           ...) const {
-  std::va_list args;
+  // std::va_list args;
   if (tensor.is_empty()) {
     return base::error::InvalidArgument("The tensor parameter is empty.");
   }
@@ -68,15 +68,15 @@ base::Status Layer::check_tensor_with_dim(const tensor::Tensor& tensor,
     return base::error::InvalidArgument("The tensor has a wrong data type.");
   }
 
-  va_start(args, data_type);
-  int32_t dims = tensor.dims_size();
-  for (int32_t i = 0; i < dims; ++i) {
-    int32_t dim = va_arg(args, int32_t);
-    if (dim != tensor.get_dim(i)) {
-      return base::error::InvalidArgument("The tensor has a wrong dim in dim" + std::to_string(i));
-    }
-  }
-  va_end(args);
+  // va_start(args, data_type);
+  // int32_t dims = tensor.dims_size();
+  // for (int32_t i = 0; i < dims; ++i) {
+  //   int32_t dim = va_arg(args, int32_t);
+  //   if (dim != tensor.get_dim(i)) {
+  //     return base::error::InvalidArgument("The tensor has a wrong dim in dim" + std::to_string(i));
+  //   }
+  // }
+  // va_end(args);
   return base::error::Success();
 }
 

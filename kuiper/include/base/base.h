@@ -9,6 +9,8 @@
   } while (0)
 
 namespace model {
+// 定义模型推理过程中需要的各种中间缓冲区类型
+// 用于分配和管理张量的内存缓存，避免频繁的动态内存申请
 enum class ModelBufferType {
   kInputTokens = 0,
   kInputEmbeddings = 1,
@@ -29,16 +31,23 @@ enum class ModelBufferType {
 
   kSinCache = 17,
   kCosCache = 18,
+  kBlockTable = 19,
+  // --- 新增：为 Batched GEMM 准备的临时连续显存 ---
+  kKeyTemp = 20,
+  kValueTemp = 21,
+  kPosGPU = 22,
 };
 }
 
 namespace base {
+// 设备类型：用于指定张量存储的硬件位置和内核计算的执行位置
 enum class DeviceType : uint8_t {
   kDeviceUnknown = 0,
   kDeviceCPU = 1,
   kDeviceCUDA = 2,
 };
 
+// 数据类型：张量内部存储元素的类型
 enum class DataType : uint8_t {
   kDataTypeUnknown = 0,
   kDataTypeFp32 = 1,
@@ -46,11 +55,13 @@ enum class DataType : uint8_t {
   kDataTypeInt32 = 3,
 };
 
+// 支持的大模型类型
 enum class ModelType : uint8_t {
   kModelTypeUnknown = 0,
   kModelTypeLLama2 = 1,
 };
 
+// 获取不同数据类型占用的字节数
 inline size_t DataTypeSize(DataType data_type) {
   if (data_type == DataType::kDataTypeFp32) {
     return sizeof(float);
@@ -63,6 +74,8 @@ inline size_t DataTypeSize(DataType data_type) {
   }
 }
 
+// 不可拷贝类基类
+// 继承此类的子类将自动禁用拷贝构造函数和赋值运算符（RAII 设计常用）
 class NoCopyable {
  protected:
   NoCopyable() = default;
@@ -74,6 +87,7 @@ class NoCopyable {
   NoCopyable& operator=(const NoCopyable&) = delete;
 };
 
+// 全局状态码
 enum StatusCode : uint8_t {
   kSuccess = 0,
   kFunctionUnImplement = 1,
@@ -84,12 +98,15 @@ enum StatusCode : uint8_t {
   kInvalidArgument = 7,
 };
 
+// 分词器类型
 enum class TokenizerType {
   kEncodeUnknown = -1,
-  kEncodeSpe = 0,
-  kEncodeBpe = 1,
+  kEncodeSpe = 0,    // SentencePiece, LLaMa 常用的 BPE 变体
+  kEncodeBpe = 1,    // Byte-Pair Encoding, Qwen 常用的分词方式
 };
 
+// 函数返回值包装类，包含错误码和错误信息字符串
+// 不抛异常，通过此类记录所有失败细节，并在上层函数之间传递状态
 class Status {
  public:
   Status(int code = StatusCode::kSuccess, std::string err_message = "");
@@ -115,11 +132,13 @@ class Status {
   void set_err_msg(const std::string& err_msg);
 
  private:
-  int code_ = StatusCode::kSuccess;
-  std::string message_;
+  int code_ = StatusCode::kSuccess;  // 当前状态码
+  std::string message_;              // 附加的错误描述
 };
 
 namespace error {
+// 核心状态检查宏
+// 调用一个返回 Status 的函数，并在遇到非 kSuccess 时用 glog 抛出致命异常并记录崩溃日志
 #define STATUS_CHECK(call)                                                                 \
   do {                                                                                     \
     const base::Status& status = call;                                                     \
@@ -133,6 +152,7 @@ namespace error {
     }                                                                                      \
   } while (0)
 
+// 各种方便创建对应 Status 对象的辅助工厂函数
 Status Success(const std::string& err_msg = "");
 
 Status FunctionNotImplement(const std::string& err_msg = "");

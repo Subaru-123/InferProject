@@ -3,9 +3,14 @@
 #include "../kernels_interface.h"
 #include "matmul_kernel.cuh"
 namespace kernel {
+
 template <int THREAD_PER_BLOCK, int ROW_PER_BLOCK>
 __global__ void matmul_kernel_cu_fp32(const float* input, const float* weight, float* output, int M,
                                       int K) {
+  int batch_idx = blockIdx.y;
+  const float* b_input = input + batch_idx * M;
+  float* b_output = output + batch_idx * K;
+
   __shared__ float sdata[THREAD_PER_BLOCK];
   unsigned int tid = threadIdx.x;
 
@@ -23,7 +28,8 @@ __global__ void matmul_kernel_cu_fp32(const float* input, const float* weight, f
   for (int p = start_row; p < end_row; ++p) {
     sdata[tid] = 0;
     int row_offset = p * M;
-    float4* input_float4_ptr = (float4*)input;
+    // --- 核心修复：必须使用各个请求专属的 b_input，彻底隔绝数据克隆 ---
+    float4* input_float4_ptr = (float4*)b_input;
     float4* weight_float4_ptr = (float4*)(weight + row_offset);
 
 #pragma unroll
@@ -36,7 +42,8 @@ __global__ void matmul_kernel_cu_fp32(const float* input, const float* weight, f
     }
 
     for (int i = pack_off + tid; i < M; i += blockDim.x) {
-      sdata[tid] += input[i] * weight[row_offset + i];
+      // --- 核心修复：必须使用各个请求专属的 b_input ---
+      sdata[tid] += b_input[i] * weight[row_offset + i];
     }
 
     __syncthreads();
@@ -47,7 +54,7 @@ __global__ void matmul_kernel_cu_fp32(const float* input, const float* weight, f
     __syncthreads();
 
     if (tid == 0) {
-      output[p] = part_sum;
+      b_output[p] = part_sum;
     }
     __syncthreads();
   }
@@ -57,6 +64,10 @@ template <int THREAD_PER_BLOCK, int ROW_PER_BLOCK>
 __global__ void matmul_kernel_cu_fp32int8(const float* input, const int8_t* weight,
                                           const float* scales, const int32_t group_size,
                                           float* output, int M, int K) {
+  int batch_idx = blockIdx.y;
+  const float* b_input = input + batch_idx * M;
+  float* b_output = output + batch_idx * K;
+
   __shared__ float sdata[THREAD_PER_BLOCK];
   unsigned int tid = threadIdx.x;
 
@@ -70,7 +81,8 @@ __global__ void matmul_kernel_cu_fp32int8(const float* input, const int8_t* weig
     for (int i = tid; i < M; i += THREAD_PER_BLOCK) {
       const int weight_idx = p * M + i;
       const int group_idx = weight_idx / group_size;
-      sdata[tid] += input[i] * scales[group_idx] * static_cast<float>(weight[weight_idx]);
+      // --- 核心修复：量化 Kernel 同步隔离 b_input ---
+      sdata[tid] += b_input[i] * scales[group_idx] * static_cast<float>(weight[weight_idx]);
     }
     __syncthreads();
 
@@ -80,7 +92,7 @@ __global__ void matmul_kernel_cu_fp32int8(const float* input, const int8_t* weig
     __syncthreads();
 
     if (tid == 0) {
-      output[p] = part_sum;
+      b_output[p] = part_sum;
     }
     __syncthreads();
   }
@@ -88,22 +100,24 @@ __global__ void matmul_kernel_cu_fp32int8(const float* input, const int8_t* weig
 
 void matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
                       const tensor::Tensor& output, const float scale, const CudaConfig* config) {
-  CHECK(input.is_empty() == false && input.dims_size() <= 2);
-  CHECK(input.device_type() == base::DeviceType::kDeviceCUDA);
+  const int32_t K = weight.get_dim(0);
+  const int32_t M = weight.get_dim(1);
 
-  CHECK(weight.is_empty() == false && weight.dims_size() == 2);
-  CHECK(weight.device_type() == base::DeviceType::kDeviceCUDA);
-  const int32_t K = weight.get_dim(0);  // row
-  const int32_t M = weight.get_dim(1);  // col
-  int packet_size = 4;
-  // CHECK_EQ(M % packet_size, 0);
+  int32_t batch_size = 1;
+  int32_t input_m = input.get_dim(0);
+  if (input.dims_size() == 2) {
+    batch_size = input.get_dim(0);
+    input_m = input.get_dim(1);
+  }
+  
+  dim3 grid(K, batch_size);
+  dim3 block(128);
 
-  CHECK_EQ(M, input.get_dim(0));
   if (config && config->stream) {
-    matmul_kernel_cu_fp32<128, 1><<<K, 128, 0, config->stream>>>(
+    matmul_kernel_cu_fp32<128, 1><<<grid, block, 0, config->stream>>>(
         input.ptr<float>(), weight.ptr<float>(), const_cast<float*>(output.ptr<float>()), M, K);
   } else {
-    matmul_kernel_cu_fp32<128, 1><<<K, 128>>>(input.ptr<float>(), weight.ptr<float>(),
+    matmul_kernel_cu_fp32<128, 1><<<grid, block>>>(input.ptr<float>(), weight.ptr<float>(),
                                               const_cast<float*>(output.ptr<float>()), M, K);
   }
 }
@@ -111,23 +125,25 @@ void matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
 void matmul_kernel_cu_qint8(const tensor::Tensor& input, const tensor::Tensor& weight,
                             const tensor::Tensor& output, int32_t group_size,
                             const tensor::Tensor& scale, const CudaConfig* config) {
-  CHECK(config != nullptr);
-  CHECK(input.is_empty() == false && input.dims_size() <= 2);
-  CHECK(input.device_type() == base::DeviceType::kDeviceCUDA);
+  const int32_t K = weight.get_dim(0);
+  const int32_t M = weight.get_dim(1);
+  
+  int32_t batch_size = 1;
+  int32_t input_m = input.get_dim(0);
+  if (input.dims_size() == 2) {
+    batch_size = input.get_dim(0);
+    input_m = input.get_dim(1);
+  }
 
-  CHECK(weight.is_empty() == false && weight.dims_size() == 2);
-  CHECK(weight.device_type() == base::DeviceType::kDeviceCUDA);
-  const int32_t K = weight.get_dim(0);  // row
-  const int32_t M = weight.get_dim(1);  // col
-  int packet_size = 4;
-  CHECK_EQ(M % packet_size, 0);
-  CHECK_EQ(M, input.get_dim(0));
+  dim3 grid(K, batch_size);
+  dim3 block(128);
+
   if (config->stream) {
-    matmul_kernel_cu_fp32int8<128, 1><<<K, 128, 0, config->stream>>>(
+    matmul_kernel_cu_fp32int8<128, 1><<<grid, block, 0, config->stream>>>(
         input.ptr<float>(), weight.ptr<int8_t>(), scale.ptr<float>(), group_size,
         const_cast<float*>(output.ptr<float>()), M, K);
   } else {
-    matmul_kernel_cu_fp32int8<128, 1><<<K, 128>>>(input.ptr<float>(), weight.ptr<int8_t>(),
+    matmul_kernel_cu_fp32int8<128, 1><<<grid, block>>>(input.ptr<float>(), weight.ptr<int8_t>(),
                                                   scale.ptr<float>(), group_size,
                                                   const_cast<float*>(output.ptr<float>()), M, K);
   }

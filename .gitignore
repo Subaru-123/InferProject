@@ -1,0 +1,20 @@
+# 告诉 Windsurf 不要去读取这些文件夹
+build/
+out/
+bin/
+*.o
+*.so
+*.a
+.cache/
+
+# 大文件 / 模型
+*.bin
+*.safetensors
+QWen/
+logs/
+
+# benchmark 可执行文件
+benchmark_frag
+
+# python cache
+__pycache__/

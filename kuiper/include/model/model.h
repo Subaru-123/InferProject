@@ -78,16 +78,17 @@ class Model {
 
   virtual void create_param_quant_layers() = 0;
 
+ public:
+  std::unique_ptr<TransformerConfig> config_;
+  std::unique_ptr<sampler::Sampler> sampler_;
+
  protected:
   int32_t group_size_ = 1;
   bool is_quant_model_ = false;
-  std::unique_ptr<TransformerConfig> config_;
-
   std::string token_path_;
   std::string model_path_;
   std::unique_ptr<op::EncodeLayerBase> encode_layer_;
   std::map<ModelBufferType, tensor::Tensor> buffers_;
-  std::unique_ptr<sampler::Sampler> sampler_;
   std::shared_ptr<RawModelData> raw_model_data_;
   base::DeviceType device_type_ = base::DeviceType::kDeviceUnknown;
   base::ModelType model_type_ = base::ModelType::kModelTypeUnknown;

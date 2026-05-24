@@ -1,6 +1,9 @@
 #ifndef KUIPER_INCLUDE_MODEL_LLAMA_H_
 #define KUIPER_INCLUDE_MODEL_LLAMA_H_
 #include <base/cuda_config.h>
+#include <vector>
+#include <random>
+#include "base/block_manager.h"
 #include "model.h"
 #include "op/add.h"
 #include "op/embedding.h"
@@ -45,6 +48,28 @@ class LLama2Model : public Model {
 
   op::EmbeddingOutput embedding(const std::vector<int>& tokens) const override;
 
+  std::vector<int32_t> get_current_block_table() const {return current_block_table_;}
+
+  void set_current_block_table(const std::vector<int32_t>& table) {
+    const_cast<LLama2Model*>(this)->current_block_table_ = table;
+  }
+
+  void ensure_batch_blocks(const tensor::Tensor& pos_tensor) const;
+
+  struct SamplingConfig {
+    float repetition_penalty = 1.0f;
+    int repetition_window = 64;
+    float temperature = 1.0f;
+    float top_p = 1.0f;
+    int top_k = 0;
+    bool do_sample = true;
+  };
+
+  void set_sampling_config(const SamplingConfig& config);
+  void set_sampling_history(const std::vector<int32_t>& history) const;
+  void reset_sampling_history() const;
+  void append_sampling_token(int32_t token) const;
+
  private:
   void init_mem() override;
 
@@ -68,10 +93,21 @@ class LLama2Model : public Model {
 
   int32_t post_processing(const tensor::Tensor& pos, bool is_prompt) const override;
 
- private:
+ public:
   std::shared_ptr<kernel::CudaConfig> cuda_config_;
   std::unique_ptr<LLama2Layers> llama_layers_;
+  std::vector<int32_t> current_block_table_;
+  mutable base::BlockManager block_manager_;
+  int32_t block_size_ = 16;
+  int32_t max_batch_size_ = 1;
+  int32_t max_blocks_per_req_ = 1;
+  mutable std::vector<int32_t> single_req_block_table_host_;
+  mutable tensor::Tensor rets_logit_;
+  SamplingConfig sampling_config_{};
+  mutable std::vector<int32_t> sampling_history_;
+  mutable std::mt19937 sampling_rng_{std::random_device{}()};
 };
+
 }  // namespace model
 
 #endif

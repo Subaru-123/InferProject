@@ -4,6 +4,8 @@ find_package(glog REQUIRED)
 
 set(link_ext_lib glog::glog GTest::gtest)
 aux_source_directory(../test DIR_TEST)
+list(FILTER DIR_TEST EXCLUDE REGEX ".*/bench_matmul_vs_cublas\\.cpp$")
+list(FILTER DIR_TEST EXCLUDE REGEX "^bench_matmul_vs_cublas\\.cpp$")
 
 aux_source_directory(../test/test_cu DIR_TEST_CU)
 aux_source_directory(../test/test_op DIR_TEST_OP)
@@ -31,3 +33,9 @@ target_link_libraries(test_llm llama)
 
 set_target_properties(test_llm PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_target_properties(test_llm PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(bench_matmul_vs_cublas bench_matmul_vs_cublas.cpp)
+target_include_directories(bench_matmul_vs_cublas PUBLIC ../kuiper/include)
+target_include_directories(bench_matmul_vs_cublas PUBLIC ../kuiper/source)
+target_link_directories(bench_matmul_vs_cublas PUBLIC ${PROJECT_SOURCE_DIR}/lib)
+target_link_libraries(bench_matmul_vs_cublas PRIVATE llama cublas cudart)

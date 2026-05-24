@@ -17,12 +17,20 @@ MatmulLayer::MatmulLayer(base::DeviceType device_type, int32_t dim0, int32_t dim
 }
 
 base::Status MatmulLayer::check() const {
-  auto status = check_tensor_with_dim(get_input(0), device_type_, data_type_, dim1_);
-  if (!status) {
+  // 1. 放宽对 Input 的一维严格校验，支持动态 Batch Size
+  // auto status = check_tensor_with_dim(get_input(0), device_type_, data_type_, dim1_);
+  // if (!status) {
+  //   LOG(ERROR) << "The input tensor error in the matmul layer.";
+  //   return status;
+  // }
+  auto& input = get_input(0);
+  if (input.is_empty() || input.size() % dim1_ != 0) {
     LOG(ERROR) << "The input tensor error in the matmul layer.";
-    return status;
+    return base::error::InvalidArgument("The input tensor is not a valid matrix.");
   }
+  int32_t batch_size = input.size() / dim1_; // 动态推断出并发数
 
+  base::Status status;
   if (!is_quant_layer_) {
     status = check_tensor_with_dim(get_weight(0), device_type_, data_type_, dim0_, dim1_);
     if (!status) {
@@ -46,10 +54,16 @@ base::Status MatmulLayer::check() const {
     }
   }
 
-  status = check_tensor_with_dim(get_output(0), device_type_, data_type_, dim0_);
-  if (!status) {
+  // status = check_tensor_with_dim(get_output(0), device_type_, data_type_, dim0_);
+  // if (!status) {
+  //   LOG(ERROR) << "The output tensor error in the matmul layer.";
+  //   return status;
+  // }
+  // 3. 放宽对 Output 的校验，只需校验总容量是否等于 BatchSize * dim0 (兼容负数 dim0)
+  auto& output = get_output(0);
+  if (output.is_empty() || output.size() != batch_size * std::abs(dim0_)) {
     LOG(ERROR) << "The output tensor error in the matmul layer.";
-    return status;
+    return base::error::InvalidArgument("The output tensor capacity is wrong.");
   }
   return base::error::Success();
 }

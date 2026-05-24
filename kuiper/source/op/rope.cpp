@@ -1,6 +1,7 @@
 #include "op/rope.h"
 #include <cmath>
 #include "kernels/cpu/rope_kernel.h"
+#include "kernels/cuda/rope_kernel.cuh"  // --- 新增：引入刚刚手写的 Batched RoPE 头文件 ---
 #include "kernels/kernels_interface.h"
 namespace op {
 RoPELayer::RoPELayer(base::DeviceType device_type, int32_t dim, int32_t kv_dim, int32_t head_size)
@@ -28,28 +29,52 @@ base::Status RoPELayer::forward() {
   if (device_type_ == base::DeviceType::kDeviceCUDA) {
     CHECK(cuda_config_ != nullptr);
   }
-  kernel::get_rope_kernel(device_type_)(dim_, kv_dim_, head_size_, input_q, input_k, input_pos,
+  // --- 核心修改：通过探测 Pos 数组大小，实现单批次与多批次的智能分发 ---
+  int32_t batch_size = input_pos.size();
+  
+  // --- 核心修复 1：拆除 batch_size > 1 的判断，无论多少并发都走 Batched 异构核函数 ---
+  if (device_type_ == base::DeviceType::kDeviceCUDA) {
+    // 启动 Continuous Batching
+    kernel::batched_rope_kernel_cu(
+        batch_size, 
+        dim_, 
+        kv_dim_, 
+        head_size_, 
+        input_pos.ptr<int32_t>(),
+        sin_cache.ptr<float>(), 
+        cos_cache.ptr<float>(),
+        const_cast<float*>(input_q.ptr<float>()), 
+        const_cast<float*>(input_k.ptr<float>()),
+        cuda_config_ ? cuda_config_->stream : nullptr);
+  } else {
+    kernel::get_rope_kernel(device_type_)(dim_, kv_dim_, head_size_, input_q, input_k, input_pos,
                                         sin_cache, cos_cache,
                                         cuda_config_ ? cuda_config_->stream : nullptr);
+  }
   return base::error::Success();
 }
 
 base::Status RoPELayer::check() const {
+  auto pos_tensor = get_input(2);
+  int32_t batch_size = pos_tensor.size();
   // pos tensor
-  auto status = check_tensor_with_dim(get_input(2), base::DeviceType::kDeviceCPU,
-                                      base::DataType::kDataTypeInt32, 1);
+  // --- 核心修改：彻底放开张量维度校验，允许传入 B * dim 的大矩阵 ---
+  auto status = check_tensor_with_dim(pos_tensor, device_type_,
+                                      base::DataType::kDataTypeInt32, batch_size);
   if (!status) {
     LOG(ERROR) << "The input tensor 2 error in the add layer.";
     return status;
   }
-
-  status = check_tensor_with_dim(get_input(1), device_type_, data_type_, kv_dim_);
+  
+  // 容量校验扩展为 batch_size * dim
+  status = check_tensor_with_dim(get_input(1), device_type_, data_type_, kv_dim_ * batch_size);
   if (!status) {
     LOG(ERROR) << "The input tensor 1 error in the add layer.";
     return status;
   }
-
-  status = check_tensor_with_dim(get_input(0), device_type_, data_type_, dim_);
+  
+  // 容量校验扩展为 batch_size * dim
+  status = check_tensor_with_dim(get_input(0), device_type_, data_type_, dim_ * batch_size);
   if (!status) {
     LOG(ERROR) << "The input tensor 0 error in the add layer.";
     return status;

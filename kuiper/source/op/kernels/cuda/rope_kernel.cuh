@@ -9,5 +9,17 @@ void rope_kernel_cu(int32_t dim, int32_t kv_dim, int32_t head_size, const tensor
 void sin_cos_cache_calc_cu(int head_size, int max_seq_len, const tensor::Tensor& sin_cache,
                            const tensor::Tensor& cos_cache, cudaStream_t stream);
 
+void batched_rope_kernel_cu(
+    int32_t batch_size,
+    int32_t q_dim,
+    int32_t kv_dim,
+    int32_t head_size,
+    const int32_t* pos_array,   // [batch_size] 存放每个请求对应的 pos
+    const float* sin_cache, 
+    const float* cos_cache,
+    float* q_array,             // [batch_size, q_dim] 连续大矩阵
+    float* k_array,             // [batch_size, kv_dim] 连续大矩阵
+    cudaStream_t stream);
+
 }  // namespace kernel
 #endif  // ROPE_KERNEL_CU_CUH
