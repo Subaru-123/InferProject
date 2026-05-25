@@ -173,27 +173,32 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
   scheduler.max_active_requests_ = model.max_batch_size_;
   scheduler.max_prefill_tokens_per_step_ = 2048;
 
-  // ── 分批提交：前一半立即提交，后一半延迟到循环中提交 ──
-  int32_t initial_count = std::max(1, (int32_t)sentences.size() / 2);
+  // ── 全量提交初始请求 + 额外动态请求（在请求完成后准入） ──
   std::unordered_map<int32_t, int32_t> req_id_to_prompt_idx;
-  std::vector<std::vector<int32_t>> generated_outputs(sentences.size());
+  std::vector<std::vector<int32_t>> generated_outputs;
 
-  for (int32_t i = 0; i < initial_count; ++i) {
+  for (int32_t i = 0; i < (int32_t)sentences.size(); ++i) {
     auto tokens = model.encode(sentences[i]);
     int32_t rid = scheduler.submit(tokens, max_gen_steps);
     req_id_to_prompt_idx[rid] = i;
   }
+  generated_outputs.resize(sentences.size());
 
-  // 剩余请求延迟提交（记录 token 列表，到点再 submit）
-  struct DelayedReq { std::vector<int32_t> tokens; int32_t prompt_idx; };
+  // 额外动态请求（等初始请求完成后有空 slot 时准入）
+  struct DelayedReq { std::vector<int32_t> tokens; std::string prompt; };
   std::vector<DelayedReq> delayed;
-  for (int32_t i = initial_count; i < (int32_t)sentences.size(); ++i) {
-    delayed.push_back({model.encode(sentences[i]), i});
+  delayed.push_back({model.encode("The little bird wanted to fly high in the sky."), ""});
+  delayed.push_back({model.encode("It was a sunny day and the children played in the park."), ""});
+
+  // 扩展 generated_outputs 容纳动态请求
+  generated_outputs.resize(sentences.size() + delayed.size());
+  for (int32_t d = 0; d < (int32_t)delayed.size(); ++d) {
+    req_id_to_prompt_idx[-(d + 1)] = sentences.size() + d;  // 用负数 key 过渡
   }
 
-  int32_t submit_interval = 20;  // 每 20 步尝试提交一个延迟请求
-  printf("[CB] initial=%d, delayed=%d, submit every %d steps\n",
-         initial_count, (int32_t)delayed.size(), submit_interval);
+  int32_t submit_interval = 60;  // 等初始请求大部分完成后提交
+  printf("[CB] initial=%d, extra_dynamic=%d, submit at step %d\n",
+         (int32_t)sentences.size(), (int32_t)delayed.size(), submit_interval);
 
   // ── 准入初始请求 ──
   scheduler.schedule_step();
@@ -254,6 +259,7 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
     }
 
     // Forward
+    if (cur_tokens.empty()) { printf("[ERR] empty cur_tokens at step %d!\n", total_steps); break; }
     sync_block_table_to_gpu(model);
     auto emb = model.embedding(cur_tokens);
     int dummy_next;
@@ -318,24 +324,29 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
 
     total_steps++;
 
-    // ── 动态提交：每 N 步从延迟队列取出一个请求 ──
-    if (!delayed.empty() && total_steps % submit_interval == 0) {
-      auto& dr = delayed.back();
-      int32_t rid = scheduler.submit(dr.tokens, max_gen_steps);
-      req_id_to_prompt_idx[rid] = dr.prompt_idx;
-      printf("[CB] step=%d: late-submitted req_id=%d (prompt_idx=%d)\n",
-             total_steps, rid, dr.prompt_idx);
-      delayed.pop_back();
+    // ── 动态提交：延迟请求在指定步数提交 ──
+    if (!delayed.empty() && total_steps == submit_interval) {
+      for (auto& dr : delayed) {
+        int32_t rid = scheduler.submit(dr.tokens, max_gen_steps);
+        // 映射到 generated_outputs 末尾
+        req_id_to_prompt_idx[rid] = sentences.size() + (&dr - &delayed[0]);
+        printf("[CB] step=%d: dynamic-submit req_id=%d \"%s\"\n",
+               total_steps, rid, dr.prompt.c_str());
+      }
+      delayed.clear();
     }
   }
 
   // ── 输出 ──
   if (need_output) {
-    for (int32_t i = 0; i < (int32_t)sentences.size(); ++i) {
+    for (int32_t i = 0; i < (int32_t)generated_outputs.size(); ++i) {
+      const char* prompt = i < (int32_t)sentences.size()
+          ? sentences[i].c_str() : "(dynamic)";
       printf("\n==================================\n");
-      printf("Prompt %d: %s\n", i, sentences[i].c_str());
-      printf("Output %d: %s%s\n", i, sentences[i].c_str(),
-             model.decode(generated_outputs[i]).data());
+      printf("Prompt %d: %s\n", i, prompt);
+      if (!generated_outputs[i].empty()) {
+        printf("Output %d: %s\n", i, model.decode(generated_outputs[i]).data());
+      }
       printf("==================================\n");
     }
     fflush(stdout);
@@ -345,8 +356,8 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
   for (int32_t i = 0; i < (int32_t)sentences.size(); ++i) {
     auto tok = model.encode(sentences[i]);
     prompt_total += tok.size();
-    gen_total += generated_outputs[i].size();
   }
+  for (auto& go : generated_outputs) gen_total += go.size();
   printf("METRICS prompt_tokens_total=%lld gen_tokens_total=%lld total_tokens_total=%lld\n",
          static_cast<long long>(prompt_total),
          static_cast<long long>(gen_total),
