@@ -546,6 +546,14 @@ int main(int argc, char* argv[]) {
     LOG(FATAL) << "The model init failed: " << init_status.get_err_code();
   }
 
+  printf("[CFG] dim=%d layers=%d seq_len=%d kv_dim=%d heads=%d head_sz=%d\n",
+         model.config_->dim_, model.config_->layer_num_, model.config_->seq_len_,
+         model.config_->kv_dim_, model.config_->head_num_, model.config_->head_size_);
+  printf("[CFG] block_sz=%d blocks_per_req=%d max_batch=%d pool=%d\n",
+         model.block_size_, model.max_blocks_per_req_, model.max_batch_size_,
+         model.block_manager_.total_blocks());
+  fflush(stdout);
+
   for (int i = 0; i < (int)sentences.size(); ++i) {
     printf("Prompt %d token_len=%d\n", i,
            (int)model.encode(sentences[i]).size());
