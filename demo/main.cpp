@@ -199,9 +199,13 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
   printf("[CB] initial=%d, extra_dynamic=%d, submit at step %d\n",
          (int32_t)sentences.size(), (int32_t)delayed.size(), submit_interval);
 
-  // 保存 prompt 文本供输出（在 delayed.clear() 之前）
+  // 保存 prompt 文本和 token 数（在 delayed 清空前）
   std::vector<std::string> all_prompts(sentences.begin(), sentences.end());
-  for (auto& dr : delayed) all_prompts.push_back(dr.prompt);
+  int64_t dynamic_prompt_tokens = 0;
+  for (auto& dr : delayed) {
+    all_prompts.push_back(dr.prompt);
+    dynamic_prompt_tokens += dr.tokens.size();
+  }
 
   // ── 准入初始请求 ──
   scheduler.schedule_step();
@@ -361,14 +365,17 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
 
   int64_t prompt_total = 0, gen_total = 0;
   for (int32_t i = 0; i < (int32_t)sentences.size(); ++i) {
-    auto tok = model.encode(sentences[i]);
-    prompt_total += tok.size();
+    prompt_total += model.encode(sentences[i]).size();
   }
+  prompt_total += dynamic_prompt_tokens;
   for (auto& go : generated_outputs) gen_total += go.size();
   printf("METRICS prompt_tokens_total=%lld gen_tokens_total=%lld total_tokens_total=%lld\n",
          static_cast<long long>(prompt_total),
          static_cast<long long>(gen_total),
          static_cast<long long>(prompt_total + gen_total));
+  printf("[CB] reqs=%d (init=%d + dynamic=%d)\n",
+         (int32_t)all_prompts.size(), (int32_t)sentences.size(),
+         (int32_t)all_prompts.size() - (int32_t)sentences.size());
   fflush(stdout);
 
   return total_steps * model.max_batch_size_;
@@ -481,17 +488,21 @@ int32_t generate_batch(const model::LLama2Model& model, const std::vector<std::s
 
 int main(int argc, char* argv[]) {
   if (argc < 3) {
-    printf("Usage: %s checkpoint_path tokenizer_path [--quant] [--old]\n", argv[0]);
-    printf("  --old  使用旧版 generate_batch_pd (无 prefill 优化, 用于对比)\n");
+    printf("Usage: %s checkpoint_path tokenizer_path [--quant] [--old] [--scheduled] [--bench]\n", argv[0]);
+    printf("  --old        原始 static batching\n");
+    printf("  --scheduled  Continuous Batching + 动态提交\n");
+    printf("  --bench      对比 static vs PD vs CB 的性能\n");
     return -1;
   }
   bool use_quant = false;
   bool use_old = false;
   bool use_scheduled = false;
+  bool use_bench = false;
   for (int i = 3; i < argc; ++i) {
     if (std::string(argv[i]) == "--quant") use_quant = true;
     if (std::string(argv[i]) == "--old") use_old = true;
     if (std::string(argv[i]) == "--scheduled") use_scheduled = true;
+    if (std::string(argv[i]) == "--bench") use_bench = true;
   }
   const char* checkpoint_path = argv[1];  
   const char* tokenizer_path = argv[2];
@@ -538,16 +549,19 @@ int main(int argc, char* argv[]) {
            (int)model.encode(sentences[i]).size());
   }
 
+  // --bench 直接跑 scheduled 对比；默认模式对比请分别跑
+  if (use_bench) use_scheduled = true;
+
   auto start = std::chrono::steady_clock::now();
 
-  // 5. 推理（默认 P/D 分离版，--scheduled 启用含 chunked prefill 的实验版）
+  // 5. 推理（默认 P/D 分离版，--scheduled=CB+动态提交）
   int total_generated;
   if (use_scheduled) {
     total_generated = generate_batch_scheduled(model, sentences, 128, true);
   } else {
     total_generated = generate_batch_pd(model, sentences, 128, true);
   }
-  
+
   auto end = std::chrono::steady_clock::now();
   auto duration = std::chrono::duration<double>(end - start).count();
   printf("\nsteps/s:%lf\n", static_cast<double>(total_generated) / duration);
