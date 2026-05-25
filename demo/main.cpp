@@ -333,6 +333,15 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
       fflush(stdout);
     }
 
+    // 调试输出（仅当有 finished 或达到特定步数时）
+    if (!to_finish.empty() || total_steps % 60 == 0) {
+      printf("[BLK] step=%d pool=%d used=%d free=%d\n", total_steps,
+             model.block_manager_.total_blocks(),
+             model.block_manager_.allocated_blocks(),
+             model.block_manager_.free_block_count());
+      fflush(stdout);
+    }
+
     // ── 动态提交：延迟请求在指定步数提交 ──
     if (!delayed.empty() && total_steps == submit_interval) {
       for (auto& dr : delayed) {
@@ -528,8 +537,8 @@ int main(int argc, char* argv[]) {
 
   // 3. 核心配置：并发数 = prompt 数量
   //    即使 prompt 比并发数长，prefill 优化用 chunked 方式处理
-  // block_table 行数必须 ≥ 最大并发（初始 + 动态）
-  model.max_batch_size_ = sentences.size() + 4;
+  // block_table 行数必须 ≥ 最大并发（初始 + 动态），同时要够 block pool
+  model.max_batch_size_ = 16;
 
   // 4. 调用 init 申请底层 Paged KV Cache 和 Block Table
   auto init_status = model.init(base::DeviceType::kDeviceCUDA);
