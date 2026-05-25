@@ -49,8 +49,10 @@ public:
     int32_t max_active_requests_ = 64;
     int32_t max_prefill_tokens_per_step_ = 2048;  // 单步最多处理多少 prefill token
 
+    // 公开访问（demo 直接迭代）
+    std::unordered_map<int32_t, ScheduleRequest> active_requests_;
+
 private:
     std::deque<ScheduleRequest> waiting_queue_;   // 等待队列
-    std::unordered_map<int32_t, ScheduleRequest> active_requests_;  // 活跃请求
     int32_t next_req_id_ = 0;
 };

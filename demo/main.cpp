@@ -173,7 +173,7 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
   scheduler.max_active_requests_ = model.max_batch_size_;
   scheduler.max_prefill_tokens_per_step_ = 2048;
 
-  // ── 提交所有请求到调度器 ──
+  // ── 提交所有请求 ──
   std::unordered_map<int32_t, int32_t> req_id_to_prompt_idx;
   std::vector<std::vector<int32_t>> generated_outputs(sentences.size());
   for (int32_t i = 0; i < (int32_t)sentences.size(); ++i) {
@@ -182,170 +182,51 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
     req_id_to_prompt_idx[rid] = i;
   }
 
-  tensor::Tensor pos_tensor = model.get_buffer(model::ModelBufferType::kInputPos);
-  auto prev_block_table = model.single_req_block_table_host_;  // 保存初始状态
-
-  int32_t total_steps = 0;
-  bool has_pending = true;
-
-  // ════════════════════════════════════════════════════════════
-  // Phase A: 初始调度 — 准入所有请求（block 由 ensure_batch_blocks 按需分配）
-  // ════════════════════════════════════════════════════════════
-  {
-    auto init_batch = scheduler.schedule_step();
-    // 重置所有 block_table 行为 -1
-    model.single_req_block_table_host_.assign(
-        model.max_batch_size_ * model.max_blocks_per_req_, -1);
-    printf("[Init] admitted %d requests, block_pool=%d blocks\n",
-           init_batch.total_batch_size, model.block_manager_.total_blocks());
-  }
-
-  // ════════════════════════════════════════════════════════════
-  // [Prefill优化] Phase B: Chunked Prefill
-  //   prompt 按 max_batch_size_ 切块，块内共享 block_table 行
-  //   例如 prompt_len=18, batch=8 → 3 chunks (8+8+2), 3次 forward
-  //   对比旧版逐 token: 18 次 forward (每 token 一次)
-  // ════════════════════════════════════════════════════════════
-  int32_t vocab_size = std::abs(model.config_->vocab_size_);
-  int32_t chunk_limit = model.max_batch_size_;  // 每块最多 token 数
-
-  for (int32_t r = 0; r < (int32_t)sentences.size(); ++r) {
-    auto tokens = model.encode(sentences[r]);
-    int32_t N = static_cast<int32_t>(tokens.size());
-    int32_t saved_row = r;
-    auto saved_block_table = model.single_req_block_table_host_;
-
-    // 重置该请求的 block_table 行
-    for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
-      model.single_req_block_table_host_[saved_row * model.max_blocks_per_req_ + k] = -1;
-    }
-
-    int32_t num_chunks = (N + chunk_limit - 1) / chunk_limit;
-    int32_t start = 0;
-    for (int32_t c = 0; c < num_chunks; ++c) {
-      int32_t end = std::min(start + chunk_limit, N);
-      int32_t chunk_sz = end - start;
-
-      // 步骤 1: 确保 chunk 内所有位置共享相同的物理块
-      //   先检查哪些逻辑块需要新物理块，统一分配后写入所有 batch row
-      for (int32_t p = 0; p < chunk_sz; ++p) {
-        pos_tensor.index<int32_t>(p) = start + p;
-        int32_t pos = start + p;
-        int32_t logical_blk = pos / model.block_size_;
-        int32_t blk = model.single_req_block_table_host_[saved_row * model.max_blocks_per_req_ + logical_blk];
-        if (blk < 0) {
-          blk = model.block_manager_.allocate_block();
-          // 写入 request row
-          model.single_req_block_table_host_[saved_row * model.max_blocks_per_req_ + logical_blk] = blk;
-        }
-        // 将 request row 的数据复制到所有 batch row
-        for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
-          model.single_req_block_table_host_[p * model.max_blocks_per_req_ + k] =
-              model.single_req_block_table_host_[saved_row * model.max_blocks_per_req_ + k];
-        }
-      }
-
-      // 同步 host → GPU（确保 MHA kernel 读到正确的 block ID）
-      sync_block_table_to_gpu(model);
-
-      // 步骤 2: forward 本块的 token
-      std::vector<int32_t> chunk_tokens(tokens.begin() + start, tokens.begin() + end);
-      auto emb = model.embedding(chunk_tokens);
-      int dummy_next;
-      auto st = model.forward(emb.input_embeddings, pos_tensor, dummy_next);
-      if (!st) { LOG(FATAL) << "Prefill Forward Error: " << st.get_err_msg(); }
-      cudaDeviceSynchronize();
-
-      // 步骤 3: 合并所有 batch row 的 block ID 到 request row
-      //   ensure_batch_blocks 独立分配每个 batch slot 的块
-      //   需要将分散的块收集到同一个 request row
-      for (int32_t p = 0; p < chunk_sz; ++p) {
-        for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
-          int32_t blk = model.single_req_block_table_host_[p * model.max_blocks_per_req_ + k];
-          if (blk >= 0) {
-            saved_block_table[saved_row * model.max_blocks_per_req_ + k] = blk;
-          }
-        }
-      }
-      model.single_req_block_table_host_ = saved_block_table;
-      sync_block_table_to_gpu(model);
-
-      start = end;
-    }
-
-    // 步骤 4: 采样最后一个 prompt token（最后一块的最后一个位置）
-    tensor::Tensor forward_output = model.get_buffer(
-        model::ModelBufferType::kForwardOutput);
-    // 最后一块的大小 = N - (num_chunks-1) * chunk_limit
-    int32_t last_chunk_sz = N - (num_chunks - 1) * chunk_limit;
-    const float* logits_last = forward_output.ptr<float>()
-        + (last_chunk_sz - 1) * vocab_size;
-    int32_t next = static_cast<int32_t>(
-        kernel::argmax_kernel_cu(logits_last, vocab_size, nullptr));
-
-    // 步骤 5: 切换到 decode
-    int32_t rid = r;
-    auto& req = scheduler.get_request(rid);
-    req.pos = N;
-    req.status = ReqStatus::kDecoding;
-    req.generated_ids.push_back(next);
-
-    if (model.is_sentence_ending(next)) {
-      int32_t pidx = req_id_to_prompt_idx[rid];
-      generated_outputs[pidx] = std::move(req.generated_ids);
-      scheduler.finish_request(rid, model.block_manager_);
-    }
-
-    total_steps += num_chunks;
-    printf("[Prefill] req %d: %d tokens → %d chunks (vs %d steps before)\n",
-           r, N, num_chunks, N);
-  }
-  fflush(stdout);
-
-  // ════════════════════════════════════════════════════════════
-  // Phase C: Decode 主循环
-  //   每个请求已在 prefill 阶段走完 prompt，现在各有一个 generated token
-  //   剩余 decode: 每步各请求生成一个新 token
-  // ════════════════════════════════════════════════════════════
-
-  // 全量同步 block_table 到 GPU（prefill 结束后的最终状态）
+  // ── 准入所有请求 ──
+  auto init_batch = scheduler.schedule_step();
+  model.single_req_block_table_host_.assign(
+      model.max_batch_size_ * model.max_blocks_per_req_, -1);
   sync_block_table_to_gpu(model);
 
-  has_pending = (scheduler.active_count() > 0);
+  tensor::Tensor pos_tensor = model.get_buffer(model::ModelBufferType::kInputPos);
+  int32_t total_steps = 0;
+  bool has_active = true;
 
-  while (has_pending && total_steps < max_gen_steps * 2) {
-    // 调度
-    auto step_batch = scheduler.schedule_step();
-    int32_t cur_batch = step_batch.total_batch_size;
+  // ── 主循环（与 generate_batch_pd 相同的逐 token 模式） ──
+  while (has_active && total_steps < max_gen_steps * 2) {
+    has_active = false;
 
-    has_pending = (!scheduler.waiting_queue_empty()
-                   || scheduler.active_count() > 0);
-    if (cur_batch == 0) {
-      if (!has_pending) break;
-      total_steps++;
-      continue;
+    // Gather
+    int32_t cur_batch = 0;
+    for (auto& kv : scheduler.active_requests_) {
+      cur_batch++;
     }
+    if (cur_batch == 0) break;
 
-    // ★ batch slot ↔ request row 映射（防交叉污染）
-    //   保存当前全部行 → 映射 → forward → 写回 request 行 → 恢复其余行
+    // slot 映射
     auto decode_saved = model.single_req_block_table_host_;
+    std::vector<int32_t> cur_tokens(cur_batch);
+    int32_t s = 0;
+    for (auto& kv : scheduler.active_requests_) {
+      int32_t rid = kv.first;
+      auto& req = kv.second;
 
-    for (int32_t s = 0; s < cur_batch; ++s) {
-      int32_t rid = step_batch.active_indices[s];
-      // 将 request 行映射到 batch slot 行
+      pos_tensor.index<int32_t>(s) = req.pos;
+
+      if (req.status == ReqStatus::kPrefilling) {
+        cur_tokens[s] = req.prompt_tokens[req.pos];
+      } else {
+        cur_tokens[s] = req.generated_ids.back();
+      }
+
+      // Copy request row to batch slot
       for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
         model.single_req_block_table_host_[s * model.max_blocks_per_req_ + k] =
             decode_saved[rid * model.max_blocks_per_req_ + k];
       }
-    }
 
-    // Gather
-    std::vector<int32_t> cur_tokens(cur_batch);
-    for (int32_t s = 0; s < cur_batch; ++s) {
-      int32_t rid = step_batch.active_indices[s];
-      auto& req = scheduler.get_request(rid);
-      pos_tensor.index<int32_t>(s) = req.pos;
-      cur_tokens[s] = req.generated_ids.back();
+      has_active = true;
+      s++;
     }
 
     // Forward
@@ -356,13 +237,15 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
     if (!st) { LOG(FATAL) << "Forward Error: " << st.get_err_msg(); }
     cudaDeviceSynchronize();
 
-    // ★ 写回：只更新活跃 request 行，其余行保持不变
-    for (int32_t s = 0; s < cur_batch; ++s) {
-      int32_t rid = step_batch.active_indices[s];
+    // Writeback
+    s = 0;
+    for (auto& kv : scheduler.active_requests_) {
+      int32_t rid = kv.first;
       for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
         decode_saved[rid * model.max_blocks_per_req_ + k] =
             model.single_req_block_table_host_[s * model.max_blocks_per_req_ + k];
       }
+      s++;
     }
     model.single_req_block_table_host_ = decode_saved;
     sync_block_table_to_gpu(model);
@@ -370,11 +253,20 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
     // Scatter
     tensor::Tensor forward_output = model.get_buffer(
         model::ModelBufferType::kForwardOutput);
+    int32_t vocab_size = std::abs(model.config_->vocab_size_);
     const float* device_logits = forward_output.ptr<float>();
 
-    for (int32_t s = 0; s < cur_batch; ++s) {
-      int32_t rid = step_batch.active_indices[s];
-      auto& req = scheduler.get_request(rid);
+    s = 0;
+    for (auto& kv : scheduler.active_requests_) {
+      int32_t rid = kv.first;
+      auto& req = kv.second;
+
+      if (req.status == ReqStatus::kPrefilling
+          && req.pos < req.prompt_len - 1) {
+        req.pos++;
+        s++;
+        continue;
+      }
 
       const float* b_logits = device_logits + s * vocab_size;
       int32_t next = static_cast<int32_t>(
@@ -382,19 +274,22 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
       req.generated_ids.push_back(next);
       req.pos++;
 
+      if (req.status == ReqStatus::kPrefilling) {
+        req.status = ReqStatus::kDecoding;
+      }
+
       if (model.is_sentence_ending(next)
           || static_cast<int32_t>(req.generated_ids.size()) >= max_gen_steps) {
-        // 收集该请求占用的物理块
-        //   初始 batch 中 req_id == block_table 行号
-        int32_t row = rid;
+        // Collect blocks
         for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
-          int32_t blk = model.single_req_block_table_host_[row * model.max_blocks_per_req_ + k];
+          int32_t blk = model.single_req_block_table_host_[rid * model.max_blocks_per_req_ + k];
           if (blk >= 0) req.block_ids.push_back(blk);
         }
         int32_t pidx = req_id_to_prompt_idx[rid];
         generated_outputs[pidx] = std::move(req.generated_ids);
         scheduler.finish_request(rid, model.block_manager_);
       }
+      s++;
     }
 
     total_steps++;

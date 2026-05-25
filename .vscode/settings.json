@@ -1,0 +1,4 @@
+{
+    "testMate.cpp.test.executables":"/root/KuiperLLama/build/*/*",
+    "testMate.cpp.test.workingDirectory": "${absDirpath}"
+}
