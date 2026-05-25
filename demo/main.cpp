@@ -174,7 +174,7 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
   scheduler.max_prefill_tokens_per_step_ = 2048;
 
   // ── 分批提交：前一半立即提交，后一半延迟到循环中提交 ──
-  int32_t initial_count = std::max(1, (int32_t)sentences.size() / 2);
+  int32_t initial_count = sentences.size();  // DEBUG: all at once
   std::unordered_map<int32_t, int32_t> req_id_to_prompt_idx;
   std::vector<std::vector<int32_t>> generated_outputs(sentences.size());
 
