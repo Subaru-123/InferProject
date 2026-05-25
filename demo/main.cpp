@@ -322,6 +322,13 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
     }
 
     total_steps++;
+    if (total_steps % 30 == 0) {
+      printf("[BLK] step=%d pool=%d used=%d free=%d\n", total_steps,
+             model.block_manager_.total_blocks(),
+             model.block_manager_.allocated_blocks(),
+             model.block_manager_.free_block_count());
+      fflush(stdout);
+    }
 
     // ── 动态提交：延迟请求在指定步数提交 ──
     if (!delayed.empty() && total_steps == submit_interval) {
