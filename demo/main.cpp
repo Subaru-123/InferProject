@@ -199,6 +199,10 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
   printf("[CB] initial=%d, extra_dynamic=%d, submit at step %d\n",
          (int32_t)sentences.size(), (int32_t)delayed.size(), submit_interval);
 
+  // 保存 prompt 文本供输出（在 delayed.clear() 之前）
+  std::vector<std::string> all_prompts(sentences.begin(), sentences.end());
+  for (auto& dr : delayed) all_prompts.push_back(dr.prompt);
+
   // ── 准入初始请求 ──
   scheduler.schedule_step();
   model.single_req_block_table_host_.assign(
@@ -311,13 +315,10 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
 
     for (int32_t rid : to_finish) {
       auto& req = scheduler.get_request(rid);
-      int32_t n_blocks = 0;
       for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
         int32_t blk = model.single_req_block_table_host_[rid * model.max_blocks_per_req_ + k];
-        if (blk >= 0) { req.block_ids.push_back(blk); n_blocks++; }
+        if (blk >= 0) req.block_ids.push_back(blk);
       }
-      printf("[FIN] req_id=%d freed %d blocks (pool free=%d)\n",
-             rid, n_blocks, model.block_manager_.free_block_count());
       int32_t pidx = req_id_to_prompt_idx[rid];
       generated_outputs[pidx] = std::move(req.generated_ids);
       scheduler.finish_request(rid, model.block_manager_);
@@ -325,15 +326,6 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
 
     total_steps++;
     if (total_steps % 30 == 0) {
-      printf("[BLK] step=%d pool=%d used=%d free=%d\n", total_steps,
-             model.block_manager_.total_blocks(),
-             model.block_manager_.allocated_blocks(),
-             model.block_manager_.free_block_count());
-      fflush(stdout);
-    }
-
-    // 调试输出（仅当有 finished 或达到特定步数时）
-    if (!to_finish.empty() || total_steps % 60 == 0) {
       printf("[BLK] step=%d pool=%d used=%d free=%d\n", total_steps,
              model.block_manager_.total_blocks(),
              model.block_manager_.allocated_blocks(),
@@ -353,10 +345,6 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
       delayed.clear();
     }
   }
-
-  // 构建动态请求的 prompt 列表供输出
-  std::vector<std::string> all_prompts(sentences.begin(), sentences.end());
-  for (auto& dr_holder : delayed) all_prompts.push_back(dr_holder.prompt);
 
   // ── 输出 ──
   if (need_output) {
@@ -544,14 +532,6 @@ int main(int argc, char* argv[]) {
   if (!init_status) {
     LOG(FATAL) << "The model init failed: " << init_status.get_err_code();
   }
-
-  printf("[CFG] dim=%d layers=%d seq_len=%d kv_dim=%d heads=%d head_sz=%d\n",
-         model.config_->dim_, model.config_->layer_num_, model.config_->seq_len_,
-         model.config_->kv_dim_, model.config_->head_num_, model.config_->head_size_);
-  printf("[CFG] block_sz=%d blocks_per_req=%d max_batch=%d pool=%d\n",
-         model.block_size_, model.max_blocks_per_req_, model.max_batch_size_,
-         model.block_manager_.total_blocks());
-  fflush(stdout);
 
   for (int i = 0; i < (int)sentences.size(); ++i) {
     printf("Prompt %d token_len=%d\n", i,
