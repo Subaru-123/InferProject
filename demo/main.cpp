@@ -195,8 +195,8 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
   printf("[CB] initial=%d, delayed=%d, submit every %d steps\n",
          initial_count, (int32_t)delayed.size(), submit_interval);
 
-  // ── 准入所有请求 ──
-  auto init_batch = scheduler.schedule_step();
+  // ── 准入初始请求 ──
+  scheduler.schedule_step();
   model.single_req_block_table_host_.assign(
       model.max_batch_size_ * model.max_blocks_per_req_, -1);
   sync_block_table_to_gpu(model);
@@ -205,24 +205,26 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
   int32_t total_steps = 0;
   bool has_active = true;
 
-  // ── 主循环（与 generate_batch_pd 相同的逐 token 模式） ──
+  // ── 主循环 ──
   while (has_active && total_steps < max_gen_steps * 2) {
-    has_active = false;
+    // ★ 每步调用 schedule_step：准入等待队列中的新请求
+    auto step_batch = scheduler.schedule_step();
+    int32_t cur_batch = step_batch.total_batch_size;
 
-    // Gather
-    int32_t cur_batch = 0;
-    for (auto& kv : scheduler.active_requests_) {
-      cur_batch++;
+    has_active = (!scheduler.waiting_queue_empty()
+                  || scheduler.active_count() > 0);
+    if (cur_batch == 0 && !has_active) break;
+    if (cur_batch == 0) {
+      total_steps++;
+      continue;
     }
-    if (cur_batch == 0) break;
 
     // slot 映射
     auto decode_saved = model.single_req_block_table_host_;
     std::vector<int32_t> cur_tokens(cur_batch);
-    int32_t s = 0;
-    for (auto& kv : scheduler.active_requests_) {
-      int32_t rid = kv.first;
-      auto& req = kv.second;
+    for (int32_t s = 0; s < cur_batch; ++s) {
+      int32_t rid = step_batch.active_indices[s];
+      auto& req = scheduler.get_request(rid);
 
       pos_tensor.index<int32_t>(s) = req.pos;
 
@@ -237,9 +239,6 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
         model.single_req_block_table_host_[s * model.max_blocks_per_req_ + k] =
             decode_saved[rid * model.max_blocks_per_req_ + k];
       }
-
-      has_active = true;
-      s++;
     }
 
     // Forward
@@ -251,34 +250,30 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
     cudaDeviceSynchronize();
 
     // Writeback
-    s = 0;
-    for (auto& kv : scheduler.active_requests_) {
-      int32_t rid = kv.first;
+    for (int32_t s = 0; s < cur_batch; ++s) {
+      int32_t rid = step_batch.active_indices[s];
       for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
         decode_saved[rid * model.max_blocks_per_req_ + k] =
             model.single_req_block_table_host_[s * model.max_blocks_per_req_ + k];
       }
-      s++;
     }
     model.single_req_block_table_host_ = decode_saved;
     sync_block_table_to_gpu(model);
 
-    // Scatter (defer finish to avoid iterator invalidation)
+    // Scatter
     tensor::Tensor forward_output = model.get_buffer(
         model::ModelBufferType::kForwardOutput);
     int32_t vocab_size = std::abs(model.config_->vocab_size_);
     const float* device_logits = forward_output.ptr<float>();
 
     std::vector<int32_t> to_finish;
-    s = 0;
-    for (auto& kv : scheduler.active_requests_) {
-      int32_t rid = kv.first;
-      auto& req = kv.second;
+    for (int32_t s = 0; s < cur_batch; ++s) {
+      int32_t rid = step_batch.active_indices[s];
+      auto& req = scheduler.get_request(rid);
 
       if (req.status == ReqStatus::kPrefilling
           && req.pos < req.prompt_len - 1) {
         req.pos++;
-        s++;
         continue;
       }
 
@@ -296,7 +291,6 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
           || static_cast<int32_t>(req.generated_ids.size()) >= max_gen_steps) {
         to_finish.push_back(rid);
       }
-      s++;
     }
 
     for (int32_t rid : to_finish) {
