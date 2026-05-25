@@ -250,12 +250,13 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
     model.single_req_block_table_host_ = decode_saved;
     sync_block_table_to_gpu(model);
 
-    // Scatter
+    // Scatter (defer finish to avoid iterator invalidation)
     tensor::Tensor forward_output = model.get_buffer(
         model::ModelBufferType::kForwardOutput);
     int32_t vocab_size = std::abs(model.config_->vocab_size_);
     const float* device_logits = forward_output.ptr<float>();
 
+    std::vector<int32_t> to_finish;
     s = 0;
     for (auto& kv : scheduler.active_requests_) {
       int32_t rid = kv.first;
@@ -280,16 +281,20 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
 
       if (model.is_sentence_ending(next)
           || static_cast<int32_t>(req.generated_ids.size()) >= max_gen_steps) {
-        // Collect blocks
-        for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
-          int32_t blk = model.single_req_block_table_host_[rid * model.max_blocks_per_req_ + k];
-          if (blk >= 0) req.block_ids.push_back(blk);
-        }
-        int32_t pidx = req_id_to_prompt_idx[rid];
-        generated_outputs[pidx] = std::move(req.generated_ids);
-        scheduler.finish_request(rid, model.block_manager_);
+        to_finish.push_back(rid);
       }
       s++;
+    }
+
+    for (int32_t rid : to_finish) {
+      auto& req = scheduler.get_request(rid);
+      for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
+        int32_t blk = model.single_req_block_table_host_[rid * model.max_blocks_per_req_ + k];
+        if (blk >= 0) req.block_ids.push_back(blk);
+      }
+      int32_t pidx = req_id_to_prompt_idx[rid];
+      generated_outputs[pidx] = std::move(req.generated_ids);
+      scheduler.finish_request(rid, model.block_manager_);
     }
 
     total_steps++;
