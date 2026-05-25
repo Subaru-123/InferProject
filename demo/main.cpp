@@ -312,10 +312,13 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
 
     for (int32_t rid : to_finish) {
       auto& req = scheduler.get_request(rid);
+      int32_t n_blocks = 0;
       for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
         int32_t blk = model.single_req_block_table_host_[rid * model.max_blocks_per_req_ + k];
-        if (blk >= 0) req.block_ids.push_back(blk);
+        if (blk >= 0) { req.block_ids.push_back(blk); n_blocks++; }
       }
+      printf("[FIN] req_id=%d freed %d blocks (pool free=%d)\n",
+             rid, n_blocks, model.block_manager_.free_block_count());
       int32_t pidx = req_id_to_prompt_idx[rid];
       generated_outputs[pidx] = std::move(req.generated_ids);
       scheduler.finish_request(rid, model.block_manager_);
