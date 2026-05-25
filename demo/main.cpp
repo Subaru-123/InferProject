@@ -242,6 +242,9 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
     }
 
     // Forward
+    printf("[DBG] step=%d cur_batch=%d tokens=[", total_steps, cur_batch);
+    for (int32_t d = 0; d < std::min(cur_batch, 4); ++d) printf("%d ", cur_tokens[d]);
+    printf("]\n"); fflush(stdout);
     sync_block_table_to_gpu(model);
     auto emb = model.embedding(cur_tokens);
     int dummy_next;
