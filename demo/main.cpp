@@ -223,12 +223,11 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
       continue;
     }
 
-    // 为新准入的 prefill 请求初始化 block_table 行
+    // 为新准入的 prefill 请求初始化 block_table 行（仅首次）
     for (int32_t s = 0; s < cur_batch; ++s) {
       int32_t rid = step_batch.active_indices[s];
       auto& req = scheduler.get_request(rid);
-      if (req.status == ReqStatus::kPrefilling && req.block_ids.empty()) {
-        // 首次出现 → 重置 block_table
+      if (req.status == ReqStatus::kPrefilling && req.pos == 0) {
         for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
           model.single_req_block_table_host_[rid * model.max_blocks_per_req_ + k] = -1;
         }
@@ -538,7 +537,7 @@ int main(int argc, char* argv[]) {
   // 3. 核心配置：并发数 = prompt 数量
   //    即使 prompt 比并发数长，prefill 优化用 chunked 方式处理
   // block_table 行数必须 ≥ 最大并发（初始 + 动态），同时要够 block pool
-  model.max_batch_size_ = 16;
+  model.max_batch_size_ = 12;
 
   // 4. 调用 init 申请底层 Paged KV Cache 和 Block Table
   auto init_status = model.init(base::DeviceType::kDeviceCUDA);
