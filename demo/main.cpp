@@ -174,7 +174,7 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
   scheduler.max_prefill_tokens_per_step_ = 2048;
 
   // ── 分批提交：前一半立即提交，后一半延迟到循环中提交 ──
-  int32_t initial_count = sentences.size();  // DEBUG: all at once
+  int32_t initial_count = std::max(1, (int32_t)sentences.size() / 2);
   std::unordered_map<int32_t, int32_t> req_id_to_prompt_idx;
   std::vector<std::vector<int32_t>> generated_outputs(sentences.size());
 
@@ -219,6 +219,18 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
       continue;
     }
 
+    // 为新准入的 prefill 请求初始化 block_table 行
+    for (int32_t s = 0; s < cur_batch; ++s) {
+      int32_t rid = step_batch.active_indices[s];
+      auto& req = scheduler.get_request(rid);
+      if (req.status == ReqStatus::kPrefilling && req.block_ids.empty()) {
+        // 首次出现 → 重置 block_table
+        for (int32_t k = 0; k < model.max_blocks_per_req_; ++k) {
+          model.single_req_block_table_host_[rid * model.max_blocks_per_req_ + k] = -1;
+        }
+      }
+    }
+
     // slot 映射
     auto decode_saved = model.single_req_block_table_host_;
     std::vector<int32_t> cur_tokens(cur_batch);
@@ -242,9 +254,6 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
     }
 
     // Forward
-    printf("[DBG] step=%d cur_batch=%d tokens=[", total_steps, cur_batch);
-    for (int32_t d = 0; d < std::min(cur_batch, 4); ++d) printf("%d ", cur_tokens[d]);
-    printf("]\n"); fflush(stdout);
     sync_block_table_to_gpu(model);
     auto emb = model.embedding(cur_tokens);
     int dummy_next;
