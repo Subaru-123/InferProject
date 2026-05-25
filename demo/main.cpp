@@ -173,14 +173,27 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
   scheduler.max_active_requests_ = model.max_batch_size_;
   scheduler.max_prefill_tokens_per_step_ = 2048;
 
-  // ── 提交所有请求 ──
+  // ── 分批提交：前一半立即提交，后一半延迟到循环中提交 ──
+  int32_t initial_count = std::max(1, (int32_t)sentences.size() / 2);
   std::unordered_map<int32_t, int32_t> req_id_to_prompt_idx;
   std::vector<std::vector<int32_t>> generated_outputs(sentences.size());
-  for (int32_t i = 0; i < (int32_t)sentences.size(); ++i) {
+
+  for (int32_t i = 0; i < initial_count; ++i) {
     auto tokens = model.encode(sentences[i]);
     int32_t rid = scheduler.submit(tokens, max_gen_steps);
     req_id_to_prompt_idx[rid] = i;
   }
+
+  // 剩余请求延迟提交（记录 token 列表，到点再 submit）
+  struct DelayedReq { std::vector<int32_t> tokens; int32_t prompt_idx; };
+  std::vector<DelayedReq> delayed;
+  for (int32_t i = initial_count; i < (int32_t)sentences.size(); ++i) {
+    delayed.push_back({model.encode(sentences[i]), i});
+  }
+
+  int32_t submit_interval = 20;  // 每 20 步尝试提交一个延迟请求
+  printf("[CB] initial=%d, delayed=%d, submit every %d steps\n",
+         initial_count, (int32_t)delayed.size(), submit_interval);
 
   // ── 准入所有请求 ──
   auto init_batch = scheduler.schedule_step();
@@ -298,6 +311,16 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
     }
 
     total_steps++;
+
+    // ── 动态提交：每 N 步从延迟队列取出一个请求 ──
+    if (!delayed.empty() && total_steps % submit_interval == 0) {
+      auto& dr = delayed.back();
+      int32_t rid = scheduler.submit(dr.tokens, max_gen_steps);
+      req_id_to_prompt_idx[rid] = dr.prompt_idx;
+      printf("[CB] step=%d: late-submitted req_id=%d (prompt_idx=%d)\n",
+             total_steps, rid, dr.prompt_idx);
+      delayed.pop_back();
+    }
   }
 
   // ── 输出 ──
