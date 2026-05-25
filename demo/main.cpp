@@ -518,7 +518,8 @@ int main(int argc, char* argv[]) {
 
   // 3. 核心配置：并发数 = prompt 数量
   //    即使 prompt 比并发数长，prefill 优化用 chunked 方式处理
-  model.max_batch_size_ = sentences.size();
+  // block_table 行数必须 ≥ 最大并发（初始 + 动态）
+  model.max_batch_size_ = sentences.size() + 4;
 
   // 4. 调用 init 申请底层 Paged KV Cache 和 Block Table
   auto init_status = model.init(base::DeviceType::kDeviceCUDA);
