@@ -187,14 +187,13 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
   // 额外动态请求（等初始请求完成后有空 slot 时准入）
   struct DelayedReq { std::vector<int32_t> tokens; std::string prompt; };
   std::vector<DelayedReq> delayed;
-  delayed.push_back({model.encode("The little bird wanted to fly high in the sky."), ""});
-  delayed.push_back({model.encode("It was a sunny day and the children played in the park."), ""});
+  delayed.push_back({model.encode("The little bird wanted to fly high in the sky."),
+                     "The little bird wanted to fly high in the sky."});
+  delayed.push_back({model.encode("It was a sunny day and the children played in the park."),
+                     "It was a sunny day and the children played in the park."});
 
   // 扩展 generated_outputs 容纳动态请求
   generated_outputs.resize(sentences.size() + delayed.size());
-  for (int32_t d = 0; d < (int32_t)delayed.size(); ++d) {
-    req_id_to_prompt_idx[-(d + 1)] = sentences.size() + d;  // 用负数 key 过渡
-  }
 
   int32_t submit_interval = 60;  // 等初始请求大部分完成后提交
   printf("[CB] initial=%d, extra_dynamic=%d, submit at step %d\n",
@@ -337,13 +336,15 @@ int32_t generate_batch_scheduled(model::LLama2Model& model,
     }
   }
 
+  // 构建动态请求的 prompt 列表供输出
+  std::vector<std::string> all_prompts(sentences.begin(), sentences.end());
+  for (auto& dr_holder : delayed) all_prompts.push_back(dr_holder.prompt);
+
   // ── 输出 ──
   if (need_output) {
     for (int32_t i = 0; i < (int32_t)generated_outputs.size(); ++i) {
-      const char* prompt = i < (int32_t)sentences.size()
-          ? sentences[i].c_str() : "(dynamic)";
       printf("\n==================================\n");
-      printf("Prompt %d: %s\n", i, prompt);
+      printf("Prompt %d: %s\n", i, all_prompts[i].c_str());
       if (!generated_outputs[i].empty()) {
         printf("Output %d: %s\n", i, model.decode(generated_outputs[i]).data());
       }
